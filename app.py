@@ -69,6 +69,87 @@ def load_prices(ticker: str, years: int) -> pd.DataFrame:
     return out
 
 
+
+
+def _extract_records(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("data", "statements", "fin_summary", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    for value in payload.values():
+        if isinstance(value, list) and (not value or isinstance(value[0], dict)):
+            return value
+    return []
+
+
+def _pick(record, *names):
+    for name in names:
+        if name in record and record[name] not in (None, ""):
+            return record[name]
+    return ""
+
+
+def _normalize_jq_quarter(value: str) -> str:
+    t = re.sub(r"\s+", "", str(value)).upper()
+    if t in {"1Q", "Q1", "1"} or "第1四半期" in t:
+        return "1Q"
+    if t in {"2Q", "Q2", "2", "HY", "H1"} or "第2四半期" in t or "中間" in t:
+        return "2Q"
+    if t in {"3Q", "Q3", "3"} or "第3四半期" in t:
+        return "3Q"
+    if t in {"FY", "4Q", "Q4", "4", "FULLYEAR", "ANNUAL"} or "通期" in t or "本決算" in t:
+        return "本決算"
+    return ""
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_jquants_earnings(code: str, api_key: str) -> tuple[pd.DataFrame, str]:
+    cols = ["earnings_date", "quarter", "announcement_time", "source"]
+    if not api_key:
+        return pd.DataFrame(columns=cols), "J-Quants: APIキー未設定"
+    jq_code = code if len(code) == 5 else f"{code}0"
+    url = "https://api.jquants.com/v2/fins/summary"
+    try:
+        response = requests.get(
+            url,
+            params={"code": jq_code},
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        records = _extract_records(response.json())
+    except Exception as exc:
+        return pd.DataFrame(columns=cols), f"J-Quants取得失敗: {type(exc).__name__}"
+
+    rows = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        dt = pd.to_datetime(_pick(rec, "DiscDate", "DisclosedDate", "disclosed_date", "Date"), errors="coerce")
+        quarter = _normalize_jq_quarter(_pick(rec, "CurPerType", "CurrentPeriodType", "TypeOfCurrentPeriod", "period_type"))
+        if pd.isna(dt) or not quarter:
+            continue
+        tm = str(_pick(rec, "DiscTime", "DisclosedTime", "disclosed_time")).strip()
+        if not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", tm):
+            tm = ""
+        elif len(tm) == 8:
+            tm = tm[:5]
+        rows.append({
+            "earnings_date": pd.Timestamp(dt).normalize(),
+            "quarter": quarter,
+            "announcement_time": tm,
+            "source": "J-Quants 財務情報",
+        })
+    if not rows:
+        return pd.DataFrame(columns=cols), f"J-Quants: 0件（応答{len(records)}件）"
+    out = pd.DataFrame(rows, columns=cols).drop_duplicates(["earnings_date", "quarter"]).sort_values("earnings_date")
+    return out.reset_index(drop=True), f"J-Quants: {len(out)}件"
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_irbank_earnings(code: str) -> tuple[pd.DataFrame, str]:
     """IRBANKの「決算発表資料」から四半期決算日を取得する。
@@ -296,6 +377,7 @@ def is_plausible_earnings_date(dt: pd.Timestamp, fy_end_month: int) -> bool:
 
 
 def combine_earnings(
+    jquants: pd.DataFrame,
     irbank: pd.DataFrame,
     yahoo: pd.DataFrame,
     uploaded: pd.DataFrame,
@@ -305,11 +387,13 @@ def combine_earnings(
     latest_price_date: pd.Timestamp,
 ) -> pd.DataFrame:
     frames = []
-    for frame in (irbank, yahoo):
+    for frame in (jquants, irbank, yahoo):
         if not frame.empty:
             f = frame.copy()
-            f["quarter"] = ""
-            f["announcement_time"] = ""
+            if "quarter" not in f.columns:
+                f["quarter"] = ""
+            if "announcement_time" not in f.columns:
+                f["announcement_time"] = ""
             frames.append(f)
     if not uploaded.empty:
         frames.append(uploaded)
@@ -332,8 +416,9 @@ def combine_earnings(
     all_dates = all_dates[(~auto_mask) | all_dates["earnings_date"].map(lambda x: is_plausible_earnings_date(x, fy_end_month))]
 
     priority = {
-        "手入力": 40,
-        "CSV": 30,
+        "手入力": 50,
+        "CSV": 40,
+        "J-Quants 財務情報": 35,
         "IRBANK 決算発表履歴": 20,
         "Yahoo Finance 決算日": 10,
     }
@@ -462,7 +547,7 @@ def source_counts(events: pd.DataFrame) -> str:
 
 
 st.title("📊 日本株 決算当日・翌営業日リアクション分析")
-st.caption("銘柄コードだけで決算発表日候補と日足を突合し、1Q・2Q・3Q・本決算ごとの短期反応を集計します。")
+st.caption("J-Quantsの財務情報と日足を突合し、1Q・2Q・3Q・本決算ごとの短期反応を集計します。")
 
 with st.sidebar:
     st.header("分析条件")
@@ -486,18 +571,20 @@ st.info(
 
 if run:
     try:
+        api_key = str(st.secrets.get("JQUANTS_API_KEY", "")).strip()
         code = normalize_code(raw_code)
         ticker = to_tse_ticker(code)
         cutoff = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize() - pd.DateOffset(years=years)
 
         with st.spinner("株価・決算発表日を取得して集計しています…"):
             prices = load_prices(ticker, years)
+            jquants, jquants_status = load_jquants_earnings(code, api_key)
             irbank, irbank_status = load_irbank_earnings(code)
             yahoo, yahoo_status = load_yahoo_earnings(ticker, max(50, years * 6))
             csv_events = parse_uploaded_csv(uploaded)
             manual_events = parse_manual_dates(manual_text)
             events = combine_earnings(
-                irbank, yahoo, csv_events, manual_events,
+                jquants, irbank, yahoo, csv_events, manual_events,
                 fy_end_month, cutoff, prices.index.max(),
             )
             detail = analyze_events(prices, events, flat_threshold)
@@ -511,10 +598,11 @@ if run:
         c4.metric("最新株価日", prices.index.max().strftime("%Y-%m-%d"))
 
         with st.expander("取得状況", expanded=detail.empty):
+            st.write(f"- {jquants_status}")
             st.write(f"- {irbank_status}")
             st.write(f"- {yahoo_status}")
             st.write(f"- 採用データ: {source_counts(events)}")
-            st.caption("IRBANKやYahoo Financeの仕様変更・通信制限時は取得件数が0になることがあります。取得できない日付を推測で追加しません。")
+            st.caption("J-Quantsを最優先し、IRBANK・Yahoo Financeは補完に使用します。Freeプランでは取得期間と遅延に制限があります。取得できない日付を推測で追加しません。")
 
         if detail.empty:
             st.error("分析可能な決算日を自動取得できませんでした。企業IR・TDnetで確認した日付をCSVまたは手入力で追加してください。")
