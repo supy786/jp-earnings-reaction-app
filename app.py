@@ -20,8 +20,9 @@ st.set_page_config(
 
 JQUANTS_URL = "https://api.jquants.com/v2/fins/summary"
 JQUANTS_MINUTE_URL = "https://api.jquants.com/v2/equities/bars/minute"
+JQUANTS_MASTER_URL = "https://api.jquants.com/v2/equities/master"
 VALID_QUARTERS = ["1Q", "2Q", "3Q", "本決算"]
-DATA_CACHE_VERSION = "2026-08-04-fin-pagination-v1"
+DATA_CACHE_VERSION = "2026-08-04-sector-pool-v1"
 
 
 # -----------------------------
@@ -436,6 +437,189 @@ def intraday_candidate_dates(prices: pd.DataFrame, events: pd.DataFrame) -> tupl
     return tuple(sorted(set(dates)))
 
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_jquants_master(api_key: str) -> tuple[pd.DataFrame, str]:
+    """上場銘柄マスタを取得し、33業種・規模区分を返す。"""
+    columns = ["Code", "CoName", "S17", "S17Nm", "S33", "S33Nm", "ScaleCat", "Mkt", "MktNm", "ProdCat"]
+    if not api_key:
+        return pd.DataFrame(columns=columns), "J-Quants APIキー未設定"
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
+    params: dict[str, str] = {}
+    records: list[dict] = []
+    seen: set[str] = set()
+    pages = 0
+    try:
+        while True:
+            response = requests.get(JQUANTS_MASTER_URL, params=params, headers=headers, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            records.extend(_extract_records(payload))
+            pages += 1
+            key = str(payload.get("pagination_key", "")).strip() if isinstance(payload, dict) else ""
+            if not key:
+                break
+            if key in seen or pages >= 100:
+                break
+            seen.add(key)
+            params["pagination_key"] = key
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        return pd.DataFrame(columns=columns), f"銘柄マスタ取得失敗: {api_error_category(status, str(exc))}"
+    except Exception as exc:
+        return pd.DataFrame(columns=columns), f"銘柄マスタ取得失敗: {type(exc).__name__}: {exc}"
+
+    rows = []
+    for record in records:
+        row = {c: str(_pick(record, c)).strip() for c in columns}
+        if row["Code"]:
+            rows.append(row)
+    frame = pd.DataFrame(rows, columns=columns)
+    if frame.empty:
+        return frame, "銘柄マスタ0件"
+    frame = frame.drop_duplicates("Code", keep="last").reset_index(drop=True)
+    return frame, f"銘柄マスタ{len(frame):,}件・{pages}ページ"
+
+
+def select_sector_peers(master: pd.DataFrame, code: str, max_peers: int) -> tuple[pd.Series | None, pd.DataFrame]:
+    """同一33業種から、同じTOPIX規模区分を優先して比較銘柄を選ぶ。"""
+    if master.empty:
+        return None, pd.DataFrame()
+    jq_code = jquants_code(code)
+    target_rows = master[master["Code"] == jq_code]
+    if target_rows.empty:
+        target_rows = master[master["Code"].str[:4] == code[:4]]
+    if target_rows.empty:
+        return None, pd.DataFrame()
+    target = target_rows.iloc[0]
+    peers = master[
+        (master["S33"] == target["S33"])
+        & (master["Code"] != target["Code"])
+        & (master["ProdCat"].isin(["", "011"]))
+        & (master["MktNm"].isin(["プライム", "スタンダード", "グロース", "Prime", "Standard", "Growth"]))
+    ].copy()
+    if peers.empty:
+        return target, peers
+    peers["規模一致"] = (peers["ScaleCat"] == target["ScaleCat"]).astype(int)
+    peers["市場一致"] = (peers["Mkt"] == target["Mkt"]).astype(int)
+    peers = peers.sort_values(["規模一致", "市場一致", "Code"], ascending=[False, False, True])
+    return target, peers.head(max_peers).reset_index(drop=True)
+
+
+def intraday_candidate_dates_from_events(events: pd.DataFrame) -> tuple[str, ...]:
+    """同業種一括分析用。開示時刻から場中候補日を作る。"""
+    dates: list[str] = []
+    if events.empty:
+        return tuple()
+    for _, event in events.iterrows():
+        day = pd.Timestamp(event["earnings_date"]).normalize()
+        clock = normalize_clock(event.get("announcement_time", ""))
+        session, strategy = classify_announcement(day, clock, True)
+        if strategy == "場中分析対象" and session in {"前場中", "昼休み", "後場中"}:
+            dates.append(day.strftime("%Y-%m-%d"))
+    return tuple(sorted(set(dates)))
+
+
+def sector_pool_analysis(
+    target_code: str,
+    api_key: str,
+    max_peers: int,
+    cutoff: pd.Timestamp,
+    target_detail: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str, pd.DataFrame]:
+    """対象銘柄＋同一33業種の分足決算反応をプールする。"""
+    master, master_status = load_jquants_master(api_key)
+    target, peers = select_sector_peers(master, target_code, max_peers)
+    if target is None:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), f"{master_status} / 対象銘柄をマスタで特定できません", pd.DataFrame()
+
+    details: list[pd.DataFrame] = []
+    if not target_detail.empty:
+        base = target_detail.copy()
+        base.insert(0, "会社名", str(target["CoName"]))
+        base.insert(0, "銘柄コード", target_code)
+        base.insert(0, "データ区分", "対象銘柄")
+        details.append(base)
+
+    peer_rows: list[dict] = []
+    for _, peer in peers.iterrows():
+        peer_code = str(peer["Code"])[:4]
+        events, e_status = load_jquants_earnings(peer_code, api_key, DATA_CACHE_VERSION)
+        events = events[events["earnings_date"] >= cutoff].copy()
+        dates = intraday_candidate_dates_from_events(events)
+        bars, m_status, available = load_jquants_minute_bars(peer_code, api_key, dates)
+        detail = analyze_intraday_events(bars, events) if not bars.empty else pd.DataFrame()
+        peer_rows.append({
+            "銘柄コード": peer_code,
+            "会社名": peer["CoName"],
+            "33業種": peer["S33Nm"],
+            "規模区分": peer["ScaleCat"],
+            "場中候補": len(dates),
+            "分足一致": len(detail),
+            "取得状態": m_status,
+        })
+        if not detail.empty:
+            detail = detail.copy()
+            detail.insert(0, "会社名", str(peer["CoName"]))
+            detail.insert(0, "銘柄コード", peer_code)
+            detail.insert(0, "データ区分", "同業種")
+            details.append(detail)
+        # APIへの短時間集中を避ける
+        time_module.sleep(0.15)
+
+    combined = pd.concat(details, ignore_index=True) if details else pd.DataFrame()
+    peer_status = pd.DataFrame(peer_rows)
+    pooled_entry = summarize_entry_timings(combined) if not combined.empty else pd.DataFrame()
+    pooled_quarter, pooled_patterns = summarize_intraday(combined) if not combined.empty else (pd.DataFrame(), pd.DataFrame())
+    status = (
+        f"{master_status} / 33業種: {target['S33Nm']} / 対象: {target['CoName']} / "
+        f"比較{len(peers)}社 / プール決算{len(combined)}件"
+    )
+    return combined, pooled_entry, pooled_quarter, status, peer_status
+
+
+def blend_target_and_sector(target_summary: pd.DataFrame, pooled_summary: pd.DataFrame) -> pd.DataFrame:
+    """対象銘柄と同業種プールを、対象銘柄を優先して縮約合成する。"""
+    if pooled_summary.empty:
+        return pd.DataFrame()
+    tmap = target_summary.set_index("エントリー") if not target_summary.empty else pd.DataFrame()
+    rows = []
+    for _, pool in pooled_summary.iterrows():
+        label = pool["エントリー"]
+        p_n = int(pool["件数"])
+        if not tmap.empty and label in tmap.index:
+            t = tmap.loc[label]
+            t_n = int(t["件数"])
+            # 対象銘柄を最大60%、同業種を最低40%として少数標本を縮約
+            target_weight = min(0.60, t_n / max(t_n + 8, 1))
+            sector_weight = 1 - target_weight
+            mean_ret = float(t["平均→引け(%)"]) * target_weight + float(pool["平均→引け(%)"]) * sector_weight
+            median_ret = float(t["中央値→引け(%)"]) * target_weight + float(pool["中央値→引け(%)"]) * sector_weight
+            win_rate = float(t["勝率(%)"]) * target_weight + float(pool["勝率(%)"]) * sector_weight
+            mean_mae = float(t["平均MAE(%)"]) * target_weight + float(pool["平均MAE(%)"]) * sector_weight
+            t_text = f"対象{t_n}件×{target_weight:.0%} / 同業{p_n}件×{sector_weight:.0%}"
+        else:
+            t_n = 0
+            mean_ret = float(pool["平均→引け(%)"])
+            median_ret = float(pool["中央値→引け(%)"])
+            win_rate = float(pool["勝率(%)"])
+            mean_mae = float(pool["平均MAE(%)"])
+            t_text = f"同業{p_n}件のみ"
+        score = mean_ret * 0.45 + median_ret * 0.25 + (win_rate - 50) / 10 * 0.15 - abs(mean_mae) * 0.15
+        rows.append({
+            "エントリー": label,
+            "対象件数": t_n,
+            "同業プール件数": p_n,
+            "合成勝率(%)": win_rate,
+            "合成平均→引け(%)": mean_ret,
+            "合成中央値→引け(%)": median_ret,
+            "合成平均MAE(%)": mean_mae,
+            "合成スコア": score,
+            "重み": t_text,
+            "確信度": confidence_label(min(p_n, 8)),
+        })
+    return pd.DataFrame(rows).sort_values(["合成スコア", "同業プール件数"], ascending=False).reset_index(drop=True)
+
 # -----------------------------
 # 日足・決算跨ぎ分析
 # -----------------------------
@@ -808,6 +992,7 @@ with st.sidebar:
     raw_code = st.text_input("銘柄コード", value="7203", max_chars=8)
     years = st.slider("決算取得年数", 2, 10, 2)
     flat_threshold = st.number_input("横ばい判定幅（±%）", 0.0, 2.0, 0.2, 0.1)
+    peer_count = st.slider("同業種の比較社数", 3, 12, 6, help="同一33業種から同じ規模区分を優先して選びます。")
     st.caption("Standardでは財務・日足を最大10年、分足はアドオン提供期間内で分析します。")
 
 st.markdown("## 分析モード")
@@ -856,6 +1041,7 @@ if run:
             "auto_intraday_summary": auto_intraday_summary,
             "auto_pattern_summary": auto_pattern_summary,
             "auto_entry_summary": auto_entry_summary,
+            "peer_count": peer_count,
         }
     except Exception as exc:
         st.error(f"処理中にエラーが発生しました: {exc}")
@@ -939,7 +1125,7 @@ if bundle:
     entry_summary = auto_entry_summary if not auto_intraday_detail.empty else csv_entry_summary
     intraday_source = "J-Quants分足API（自動）" if not auto_intraday_detail.empty else ("CSV補完" if not csv_intraday_detail.empty else "未取得")
 
-    tab1, tab2, tab3 = st.tabs(["🔵 場中決算分析", "🟢 引け後決算分析", "📋 全決算明細"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🔵 場中決算分析", "🧩 同業種プール", "🟢 引け後決算分析", "📋 全決算明細"])
 
     with tab1:
         st.markdown("## 場中決算：発表直後から引けまで")
@@ -1017,6 +1203,75 @@ if bundle:
             )
 
     with tab2:
+        st.markdown("## 同業種プール分析")
+        st.caption("対象銘柄の少数標本を、J-Quants上場銘柄マスタの同一33業種で補完します。同業種は業界の近似であり、完全な競合企業分類ではありません。")
+        st.info(
+            f"対象銘柄の分足は {len(auto_intraday_detail)}件です。ボタンを押すと同一33業種から最大{bundle.get('peer_count', 6)}社を選び、各社の場中決算分足を取得します。初回は数分かかる場合があります。"
+        )
+        pool_key = f"sector_pool_{code}_{bundle.get('peer_count', 6)}"
+        if st.button("同業種プールを作成", type="primary", use_container_width=True, key=f"run_{pool_key}"):
+            try:
+                api_key = str(st.secrets.get("JQUANTS_API_KEY", "")).strip()
+                cutoff_pool = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize() - pd.DateOffset(years=2, months=1)
+                progress = st.progress(0, text="同業種銘柄を取得しています…")
+                combined, pooled_entry, pooled_quarter, pool_status, peer_status = sector_pool_analysis(
+                    code,
+                    api_key,
+                    int(bundle.get("peer_count", 6)),
+                    cutoff_pool,
+                    auto_intraday_detail,
+                )
+                progress.progress(100, text="同業種プール分析が完了しました")
+                blended = blend_target_and_sector(auto_entry_summary, pooled_entry)
+                st.session_state[pool_key] = {
+                    "combined": combined,
+                    "pooled_entry": pooled_entry,
+                    "pooled_quarter": pooled_quarter,
+                    "pool_status": pool_status,
+                    "peer_status": peer_status,
+                    "blended": blended,
+                }
+            except Exception as exc:
+                st.error(f"同業種プール分析でエラーが発生しました: {exc}")
+
+        pool = st.session_state.get(pool_key)
+        if pool:
+            st.success(pool["pool_status"])
+            blended = pool["blended"]
+            if not blended.empty:
+                best = blended.iloc[0]
+                st.success(
+                    f"総合参考1位：{best['エントリー']}｜合成平均 {best['合成平均→引け(%)']:+.2f}%｜"
+                    f"合成勝率 {best['合成勝率(%)']:.1f}%｜合成MAE {best['合成平均MAE(%)']:+.2f}%｜"
+                    f"対象{int(best['対象件数'])}件・同業{int(best['同業プール件数'])}件｜確信度 {best['確信度']}"
+                )
+                bdisplay = blended.copy()
+                nums = bdisplay.select_dtypes(include=[np.number]).columns
+                bdisplay[nums] = bdisplay[nums].round(2)
+                st.markdown("### 対象銘柄＋同業種の縮約ランキング")
+                st.dataframe(bdisplay, use_container_width=True, hide_index=True)
+                st.caption("対象銘柄を優先しつつ、少数標本を同業種データへ縮約した参考値です。対象銘柄固有の癖を断定するものではありません。")
+            if not pool["pooled_entry"].empty:
+                pdisplay = pool["pooled_entry"].copy()
+                nums = pdisplay.select_dtypes(include=[np.number]).columns
+                pdisplay[nums] = pdisplay[nums].round(2)
+                st.markdown("### 同業種プール単体のエントリー比較")
+                st.dataframe(pdisplay, use_container_width=True, hide_index=True)
+            if not pool["peer_status"].empty:
+                st.markdown("### 採用した比較銘柄と取得状況")
+                st.dataframe(pool["peer_status"], use_container_width=True, hide_index=True)
+            if not pool["combined"].empty:
+                st.download_button(
+                    "同業種プール明細CSVをダウンロード",
+                    pool["combined"].to_csv(index=False).encode("utf-8-sig"),
+                    f"{code}_sector_pool_intraday.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
+        else:
+            st.warning("同業種プールはまだ作成されていません。API呼び出し数が増えるため、必要なときだけ実行してください。")
+
+    with tab3:
         st.markdown("## 引け後決算：翌営業日のGU・終値")
         if carry_summary.empty:
             st.warning("取得期間内に引け後・休場日発表がないか、件数が不足しています。")
@@ -1032,7 +1287,7 @@ if bundle:
             display[num] = display[num].round(2)
             st.dataframe(display, use_container_width=True, hide_index=True)
 
-    with tab3:
+    with tab4:
         st.markdown("## 決算日時・日足反応一覧")
         if daily_detail.empty:
             st.error("分析可能な決算データがありません。")
