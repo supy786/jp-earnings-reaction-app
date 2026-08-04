@@ -71,105 +71,143 @@ def load_prices(ticker: str, years: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_irbank_earnings(code: str) -> tuple[pd.DataFrame, str]:
-    """IRBANKの決算発表資料・決算履歴から四半期決算日を抽出する。
+    """IRBANKの「決算発表資料」から四半期決算日を取得する。
 
-    1) 銘柄トップページの「提出日・時間・区分・資料」表
-    2) /pl の決算履歴表（四半期・提出日）
-    の順に取得する。予想行、業績修正、配当のみの開示は除外する。
+    Streamlit Cloud等からIRBANK本体へ直接接続できない場合があるため、
+    1. IRBANK本体HTML
+    2. Jina Reader経由のMarkdown
+    の順で取得する。取得できない日付を推測で補完しない。
     """
 
-    def quarter_from_text(value: str) -> str:
+    cols = ["earnings_date", "quarter", "announcement_time", "source"]
+    records: list[dict] = []
+    diagnostics: list[str] = []
+
+    def normalize_quarter(value: str) -> str:
         t = re.sub(r"\s+", "", str(value)).upper()
-        if any(x in t for x in ("1Q", "第1四半期", "第一四半期")):
+        if t in {"1Q", "第1四半期", "第一四半期"} or "第1四半期" in t:
             return "1Q"
-        if any(x in t for x in ("2Q", "第2四半期", "第二四半期", "中間期", "中間決算")):
+        if t in {"2Q", "第2四半期", "第二四半期", "中間", "中間期"} or "第2四半期" in t:
             return "2Q"
-        if any(x in t for x in ("3Q", "第3四半期", "第三四半期")):
+        if t in {"3Q", "第3四半期", "第三四半期"} or "第3四半期" in t:
             return "3Q"
-        if any(x in t for x in ("通期", "本決算", "年度決算", "決算短信〔", "決算短信【")):
-            # 四半期表記がない通常の決算短信は通期候補
+        if t in {"通期", "本決算", "年度決算"}:
             return "本決算"
         return ""
 
-    records: list[dict] = []
-    notes: list[str] = []
-    urls = [f"https://irbank.net/{code}", f"https://irbank.net/{code}/pl"]
+    def add_record(date_text: str, time_text: str, quarter_text: str, source: str) -> None:
+        q = normalize_quarter(quarter_text)
+        if not q:
+            return
+        dt = pd.to_datetime(str(date_text).strip(), errors="coerce")
+        if pd.isna(dt):
+            return
+        tm = str(time_text).strip()
+        if not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", tm):
+            tm = ""
+        records.append({
+            "earnings_date": pd.Timestamp(dt).normalize(),
+            "quarter": q,
+            "announcement_time": tm,
+            "source": source,
+        })
 
-    for url in urls:
-        try:
-            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=25)
-            r.raise_for_status()
-        except Exception as exc:
-            notes.append(f"{url.rsplit('/', 1)[-1] or 'top'}取得失敗:{type(exc).__name__}")
-            continue
-
-        # HTML表を優先。IRBANKはページによって列名が異なるため全表を走査する。
+    # 1) IRBANK本体。表の列名を明示的に見る。
+    direct_url = f"https://irbank.net/{code}"
+    try:
+        r = requests.get(
+            direct_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+                "Cache-Control": "no-cache",
+            },
+            timeout=25,
+        )
+        r.raise_for_status()
+        diagnostics.append(f"直接取得HTTP {r.status_code}")
         try:
             tables = pd.read_html(io.StringIO(r.text))
         except Exception:
             tables = []
-
         for table in tables:
-            table.columns = [" ".join(map(str, c)).strip() if isinstance(c, tuple) else str(c).strip() for c in table.columns]
-            date_cols = [c for c in table.columns if any(k in c for k in ("提出日", "発表日", "日付"))]
-            if not date_cols:
+            table.columns = [
+                " ".join(map(str, c)).strip() if isinstance(c, tuple) else str(c).strip()
+                for c in table.columns
+            ]
+            colmap = {re.sub(r"\s+", "", c): c for c in table.columns}
+            date_col = next((orig for key, orig in colmap.items() if key in {"提出日", "発表日", "日付"}), None)
+            quarter_col = next((orig for key, orig in colmap.items() if key in {"区分", "四半期"}), None)
+            time_col = next((orig for key, orig in colmap.items() if key == "時間"), None)
+            if not date_col or not quarter_col:
                 continue
-            date_col = date_cols[0]
             for _, row in table.iterrows():
-                joined = " ".join(str(v) for v in row.tolist() if pd.notna(v))
-                # 予想・修正・配当だけの行は決算反応日から除外
-                if "予想" in joined and "実績" not in joined and "決算短信" not in joined:
-                    continue
-                if any(k in joined for k in ("業績予想の修正", "配当予想", "自己株式", "訂正")) and "決算短信" not in joined:
-                    continue
-                dt = pd.to_datetime(row.get(date_col), errors="coerce")
-                if pd.isna(dt):
-                    # セルに時刻などが混ざるケース
-                    m = re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", str(row.get(date_col)))
-                    if m:
-                        dt = pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                if pd.isna(dt):
-                    continue
-                q = quarter_from_text(joined)
-                # /plの「1Q実績」等、またはトップページの区分を採用
-                if not q:
-                    continue
-                records.append({
-                    "earnings_date": pd.Timestamp(dt).normalize(),
-                    "quarter": q,
-                    "announcement_time": "",
-                    "source": "IRBANK 決算発表資料",
-                })
+                add_record(
+                    row.get(date_col, ""),
+                    row.get(time_col, "") if time_col else "",
+                    row.get(quarter_col, ""),
+                    "IRBANK 決算発表資料",
+                )
+    except Exception as exc:
+        diagnostics.append(f"直接取得失敗:{type(exc).__name__}")
 
-        # 表が取れない場合のフォールバック：ページ内テキストから
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tr in soup.find_all("tr"):
-            joined = " ".join(tr.stripped_strings)
-            q = quarter_from_text(joined)
-            if not q or ("予想" in joined and "実績" not in joined and "決算短信" not in joined):
-                continue
-            m = re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", joined)
-            if not m:
-                continue
-            try:
-                dt = pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            except ValueError:
-                continue
-            tm = re.search(r"(?<!\d)([01]?\d|2[0-3]):[0-5]\d(?!\d)", joined)
-            records.append({
-                "earnings_date": dt.normalize(),
-                "quarter": q,
-                "announcement_time": tm.group(0) if tm else "",
-                "source": "IRBANK 決算発表資料",
-            })
+    # 2) 直接取得が0件ならJina Reader経由。Markdown表を正規表現で読む。
+    if not records:
+        jina_url = f"https://r.jina.ai/https://irbank.net/{code}"
+        try:
+            jr = requests.get(
+                jina_url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/plain,text/markdown,*/*",
+                    "X-Return-Format": "markdown",
+                    "X-Timeout": "30",
+                },
+                timeout=45,
+            )
+            jr.raise_for_status()
+            text = jr.text
+            diagnostics.append(f"Jina取得HTTP {jr.status_code}")
+
+            # 決算発表資料セクション以降だけを優先して誤検出を抑える。
+            marker = text.find("決算発表資料")
+            if marker >= 0:
+                text = text[marker:]
+
+            # 例: 2025/11/04 | 11:30 | 2Q | ...
+            pattern = re.compile(
+                r"(?m)^\s*(20\d{2}[/-]\d{1,2}[/-]\d{1,2})\s*\|\s*"
+                r"((?:[01]?\d|2[0-3]):[0-5]\d)?\s*\|\s*"
+                r"(1Q|2Q|3Q|通期|本決算)\s*\|"
+            )
+            for m in pattern.finditer(text):
+                add_record(m.group(1), m.group(2), m.group(3), "IRBANK（Jina経由）")
+
+            # Markdown化で縦棒が消えた場合の行単位フォールバック。
+            if not records:
+                line_pattern = re.compile(
+                    r"(20\d{2}[/-]\d{1,2}[/-]\d{1,2}).{0,30}?"
+                    r"((?:[01]?\d|2[0-3]):[0-5]\d).{0,20}?"
+                    r"(?:\b(1Q|2Q|3Q)\b|(通期|本決算))"
+                )
+                for line in text.splitlines():
+                    m = line_pattern.search(line)
+                    if m:
+                        add_record(m.group(1), m.group(2), m.group(3) or m.group(4), "IRBANK（Jina経由）")
+        except Exception as exc:
+            diagnostics.append(f"Jina取得失敗:{type(exc).__name__}")
 
     if not records:
-        note = " / ".join(notes) if notes else "四半期決算行0件"
-        return pd.DataFrame(columns=["earnings_date", "quarter", "announcement_time", "source"]), f"IRBANK: {note}"
+        return pd.DataFrame(columns=cols), "IRBANK: 0件（" + " / ".join(diagnostics) + "）"
 
-    result = pd.DataFrame(records)
-    result = result.drop_duplicates(["earnings_date", "quarter"]).sort_values("earnings_date").reset_index(drop=True)
-    return result, f"IRBANK: 四半期決算{len(result)}件"
+    result = pd.DataFrame(records, columns=cols)
+    result = (
+        result.drop_duplicates(["earnings_date", "quarter"], keep="first")
+        .sort_values("earnings_date")
+        .reset_index(drop=True)
+    )
+    return result, f"IRBANK: 四半期決算{len(result)}件（" + " / ".join(diagnostics) + "）"
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
