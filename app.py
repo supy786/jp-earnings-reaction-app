@@ -21,6 +21,7 @@ st.set_page_config(
 JQUANTS_URL = "https://api.jquants.com/v2/fins/summary"
 JQUANTS_MINUTE_URL = "https://api.jquants.com/v2/equities/bars/minute"
 VALID_QUARTERS = ["1Q", "2Q", "3Q", "本決算"]
+DATA_CACHE_VERSION = "2026-08-04-fin-pagination-v1"
 
 
 # -----------------------------
@@ -198,24 +199,62 @@ def load_daily_prices(ticker: str, years: int) -> pd.DataFrame:
     return out[~out.index.duplicated(keep="last")].sort_index()
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def load_jquants_earnings(code: str, api_key: str) -> tuple[pd.DataFrame, str]:
+@st.cache_data(ttl=900, show_spinner=False)
+def load_jquants_earnings(
+    code: str, api_key: str, cache_version: str = DATA_CACHE_VERSION
+) -> tuple[pd.DataFrame, str]:
+    """J-Quants財務情報を全ページ取得する。
+
+    cache_version はプラン変更・取得仕様変更時に古いStreamlitキャッシュを
+    確実に無効化するためのダミー引数。
+    """
+    del cache_version
     columns = ["earnings_date", "quarter", "announcement_time", "source", "doc_type"]
     if not api_key:
         return pd.DataFrame(columns=columns), "J-Quants APIキー未設定"
 
-    try:
-        response = requests.get(
-            JQUANTS_URL,
-            params={"code": jquants_code(code)},
-            headers={"x-api-key": api_key, "Accept": "application/json"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        records = _extract_records(response.json())
-    except Exception as exc:
-        return pd.DataFrame(columns=columns), f"J-Quants取得失敗: {type(exc).__name__}"
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
+    params: dict[str, str] = {"code": jquants_code(code)}
+    all_records: list[dict] = []
+    page_count = 0
+    seen_keys: set[str] = set()
 
+    try:
+        while True:
+            response = requests.get(
+                JQUANTS_URL,
+                params=params,
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            all_records.extend(_extract_records(payload))
+            page_count += 1
+
+            pagination_key = (
+                str(payload.get("pagination_key", "")).strip()
+                if isinstance(payload, dict)
+                else ""
+            )
+            if not pagination_key:
+                break
+            if pagination_key in seen_keys:
+                raise RuntimeError("財務情報APIのページングキーが循環しました。")
+            seen_keys.add(pagination_key)
+            params["pagination_key"] = pagination_key
+
+            # 想定外の無限取得を防止
+            if page_count >= 100:
+                raise RuntimeError("財務情報APIのページ数が上限を超えました。")
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        category = api_error_category(status_code, str(exc))
+        return pd.DataFrame(columns=columns), f"J-Quants取得失敗: {category}"
+    except Exception as exc:
+        return pd.DataFrame(columns=columns), f"J-Quants取得失敗: {type(exc).__name__}: {exc}"
+
+    records = all_records
     rows: list[dict] = []
     excluded = 0
     for record in records:
@@ -245,7 +284,10 @@ def load_jquants_earnings(code: str, api_key: str) -> tuple[pd.DataFrame, str]:
         )
 
     if not rows:
-        return pd.DataFrame(columns=columns), f"J-Quants採用0件（API応答{len(records)}件・対象外{excluded}件）"
+        return (
+            pd.DataFrame(columns=columns),
+            f"J-Quants採用0件（全{page_count}ページ・API応答{len(records)}件・対象外{excluded}件）",
+        )
 
     raw = pd.DataFrame(rows)
     before = len(raw)
@@ -261,9 +303,12 @@ def load_jquants_earnings(code: str, api_key: str) -> tuple[pd.DataFrame, str]:
     duplicates = before - len(out)
     counts = out["quarter"].value_counts().reindex(VALID_QUARTERS, fill_value=0)
     count_text = " / ".join(f"{q}:{int(n)}件" for q, n in counts.items())
+    oldest = pd.Timestamp(out["earnings_date"].min()).strftime("%Y-%m-%d")
+    newest = pd.Timestamp(out["earnings_date"].max()).strftime("%Y-%m-%d")
     status = (
-        f"J-Quants採用{len(out)}件（API応答{len(records)}件・対象外{excluded}件・"
-        f"重複統合{duplicates}件）｜{count_text}"
+        f"J-Quants採用{len(out)}件（全{page_count}ページ・API応答{len(records)}件・"
+        f"対象外{excluded}件・重複統合{duplicates}件）｜{count_text}｜"
+        f"取得範囲 {oldest}〜{newest}"
     )
     return out[columns], status
 
@@ -763,7 +808,7 @@ with st.sidebar:
     raw_code = st.text_input("銘柄コード", value="7203", max_chars=8)
     years = st.slider("決算取得年数", 2, 10, 2)
     flat_threshold = st.number_input("横ばい判定幅（±%）", 0.0, 2.0, 0.2, 0.1)
-    st.caption("Freeプランは取得期間・遅延の制限があります。")
+    st.caption("Standardでは財務・日足を最大10年、分足はアドオン提供期間内で分析します。")
 
 st.markdown("## 分析モード")
 st.info(
@@ -780,7 +825,7 @@ if run:
 
         with st.spinner("決算日時・日足・分足の利用可否を確認しています…"):
             prices = load_daily_prices(ticker, years)
-            events, jq_status = load_jquants_earnings(code, api_key)
+            events, jq_status = load_jquants_earnings(code, api_key, DATA_CACHE_VERSION)
             events = events[
                 (events["earnings_date"] >= cutoff)
                 & (events["earnings_date"] <= prices.index.max())
