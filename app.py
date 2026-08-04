@@ -71,50 +71,105 @@ def load_prices(ticker: str, years: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_irbank_earnings(code: str) -> tuple[pd.DataFrame, str]:
-    """IRBANKの決算発表履歴ページから日付を抽出する。
+    """IRBANKの決算発表資料・決算履歴から四半期決算日を抽出する。
 
-    HTML構造変更時は空データを返し、他ソースへフォールバックする。
-    ページ自体が決算発表履歴のため、抽出した日付候補を使用するが、
-    未来日と古すぎる日付は後段で除外する。
+    1) 銘柄トップページの「提出日・時間・区分・資料」表
+    2) /pl の決算履歴表（四半期・提出日）
+    の順に取得する。予想行、業績修正、配当のみの開示は除外する。
     """
-    url = f"https://irbank.net/{code}/pl"
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
-        r.raise_for_status()
-    except Exception as exc:
-        return pd.DataFrame(columns=["earnings_date", "source"]), f"IRBANK取得失敗: {type(exc).__name__}"
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text(" ", strip=True)
-    date_tokens = set()
+    def quarter_from_text(value: str) -> str:
+        t = re.sub(r"\s+", "", str(value)).upper()
+        if any(x in t for x in ("1Q", "第1四半期", "第一四半期")):
+            return "1Q"
+        if any(x in t for x in ("2Q", "第2四半期", "第二四半期", "中間期", "中間決算")):
+            return "2Q"
+        if any(x in t for x in ("3Q", "第3四半期", "第三四半期")):
+            return "3Q"
+        if any(x in t for x in ("通期", "本決算", "年度決算", "決算短信〔", "決算短信【")):
+            # 四半期表記がない通常の決算短信は通期候補
+            return "本決算"
+        return ""
 
-    patterns = [
-        r"(?<!\d)(20\d{2})[/-](\d{1,2})[/-](\d{1,2})(?!\d)",
-        r"(?<!\d)(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日",
-    ]
-    for pattern in patterns:
-        for y, m, d in re.findall(pattern, text):
+    records: list[dict] = []
+    notes: list[str] = []
+    urls = [f"https://irbank.net/{code}", f"https://irbank.net/{code}/pl"]
+
+    for url in urls:
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=25)
+            r.raise_for_status()
+        except Exception as exc:
+            notes.append(f"{url.rsplit('/', 1)[-1] or 'top'}取得失敗:{type(exc).__name__}")
+            continue
+
+        # HTML表を優先。IRBANKはページによって列名が異なるため全表を走査する。
+        try:
+            tables = pd.read_html(io.StringIO(r.text))
+        except Exception:
+            tables = []
+
+        for table in tables:
+            table.columns = [" ".join(map(str, c)).strip() if isinstance(c, tuple) else str(c).strip() for c in table.columns]
+            date_cols = [c for c in table.columns if any(k in c for k in ("提出日", "発表日", "日付"))]
+            if not date_cols:
+                continue
+            date_col = date_cols[0]
+            for _, row in table.iterrows():
+                joined = " ".join(str(v) for v in row.tolist() if pd.notna(v))
+                # 予想・修正・配当だけの行は決算反応日から除外
+                if "予想" in joined and "実績" not in joined and "決算短信" not in joined:
+                    continue
+                if any(k in joined for k in ("業績予想の修正", "配当予想", "自己株式", "訂正")) and "決算短信" not in joined:
+                    continue
+                dt = pd.to_datetime(row.get(date_col), errors="coerce")
+                if pd.isna(dt):
+                    # セルに時刻などが混ざるケース
+                    m = re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", str(row.get(date_col)))
+                    if m:
+                        dt = pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                if pd.isna(dt):
+                    continue
+                q = quarter_from_text(joined)
+                # /plの「1Q実績」等、またはトップページの区分を採用
+                if not q:
+                    continue
+                records.append({
+                    "earnings_date": pd.Timestamp(dt).normalize(),
+                    "quarter": q,
+                    "announcement_time": "",
+                    "source": "IRBANK 決算発表資料",
+                })
+
+        # 表が取れない場合のフォールバック：ページ内テキストから
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tr in soup.find_all("tr"):
+            joined = " ".join(tr.stripped_strings)
+            q = quarter_from_text(joined)
+            if not q or ("予想" in joined and "実績" not in joined and "決算短信" not in joined):
+                continue
+            m = re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", joined)
+            if not m:
+                continue
             try:
-                date_tokens.add(pd.Timestamp(year=int(y), month=int(m), day=int(d)).normalize())
+                dt = pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             except ValueError:
-                pass
+                continue
+            tm = re.search(r"(?<!\d)([01]?\d|2[0-3]):[0-5]\d(?!\d)", joined)
+            records.append({
+                "earnings_date": dt.normalize(),
+                "quarter": q,
+                "announcement_time": tm.group(0) if tm else "",
+                "source": "IRBANK 決算発表資料",
+            })
 
-    # hrefやtime要素に日付が入るケースも拾う
-    for tag in soup.find_all(["time", "a", "td", "span"]):
-        candidate = " ".join(filter(None, [tag.get("datetime"), tag.get("href"), tag.get_text(" ", strip=True)]))
-        for pattern in patterns:
-            for y, m, d in re.findall(pattern, candidate):
-                try:
-                    date_tokens.add(pd.Timestamp(year=int(y), month=int(m), day=int(d)).normalize())
-                except ValueError:
-                    pass
+    if not records:
+        note = " / ".join(notes) if notes else "四半期決算行0件"
+        return pd.DataFrame(columns=["earnings_date", "quarter", "announcement_time", "source"]), f"IRBANK: {note}"
 
-    if not date_tokens:
-        return pd.DataFrame(columns=["earnings_date", "source"]), "IRBANK: 日付候補0件"
-
-    result = pd.DataFrame({"earnings_date": sorted(date_tokens)})
-    result["source"] = "IRBANK 決算発表履歴"
-    return result, f"IRBANK: {len(result)}件抽出"
+    result = pd.DataFrame(records)
+    result = result.drop_duplicates(["earnings_date", "quarter"]).sort_values("earnings_date").reset_index(drop=True)
+    return result, f"IRBANK: 四半期決算{len(result)}件"
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
