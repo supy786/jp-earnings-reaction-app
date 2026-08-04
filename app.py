@@ -18,6 +18,7 @@ st.set_page_config(
 )
 
 JQUANTS_URL = "https://api.jquants.com/v2/fins/summary"
+JQUANTS_MINUTE_URL = "https://api.jquants.com/v2/equities/bars/minute"
 VALID_QUARTERS = ["1Q", "2Q", "3Q", "本決算"]
 
 
@@ -238,6 +239,115 @@ def load_jquants_earnings(code: str, api_key: str) -> tuple[pd.DataFrame, str]:
         f"重複統合{duplicates}件）｜{count_text}"
     )
     return out[columns], status
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_jquants_minute_bars(
+    code: str, api_key: str, dates: tuple[str, ...]
+) -> tuple[pd.DataFrame, str, bool]:
+    """J-Quants分足アドオンから、指定した決算日の1分足を取得する。
+
+    Returns:
+        bars: DatetimeIndexのOHLCV
+        status: 画面表示用メッセージ
+        addon_available: API利用権限があるか
+    """
+    columns = ["Open", "High", "Low", "Close", "Volume", "Value"]
+    if not api_key:
+        return pd.DataFrame(columns=columns), "J-Quants APIキー未設定", False
+    if not dates:
+        return pd.DataFrame(columns=columns), "場中決算候補なし", True
+
+    all_records: list[dict] = []
+    failed_dates: list[str] = []
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
+
+    for date_text in dates:
+        params = {"code": jquants_code(code), "date": date_text}
+        pagination_key = ""
+        while True:
+            if pagination_key:
+                params["pagination_key"] = pagination_key
+            try:
+                response = requests.get(
+                    JQUANTS_MINUTE_URL,
+                    params=params,
+                    headers=headers,
+                    timeout=30,
+                )
+            except Exception as exc:
+                failed_dates.append(f"{date_text}:{type(exc).__name__}")
+                break
+
+            if response.status_code in (401, 403):
+                message = (
+                    "分足アドオン未契約または権限不足"
+                    f"（HTTP {response.status_code}）。CSV補完を利用できます。"
+                )
+                return pd.DataFrame(columns=columns), message, False
+            if response.status_code == 429:
+                failed_dates.append(f"{date_text}:レート制限")
+                break
+            try:
+                response.raise_for_status()
+                payload = response.json()
+            except Exception as exc:
+                failed_dates.append(f"{date_text}:{type(exc).__name__}")
+                break
+
+            records = _extract_records(payload)
+            all_records.extend(records)
+            pagination_key = str(payload.get("pagination_key", "")).strip() if isinstance(payload, dict) else ""
+            if not pagination_key:
+                break
+
+    if not all_records:
+        detail = " / ".join(failed_dates[:3])
+        suffix = f"（{detail}）" if detail else ""
+        return pd.DataFrame(columns=columns), f"分足API取得0件{suffix}", True
+
+    rows: list[dict] = []
+    for record in all_records:
+        day = str(_pick(record, "Date", "date")).strip()
+        clock = str(_pick(record, "Time", "time")).strip()
+        dt = pd.to_datetime(f"{day} {clock}", errors="coerce")
+        if pd.isna(dt):
+            continue
+        rows.append(
+            {
+                "datetime": pd.Timestamp(dt),
+                "Open": pd.to_numeric(_pick(record, "O", "Open"), errors="coerce"),
+                "High": pd.to_numeric(_pick(record, "H", "High"), errors="coerce"),
+                "Low": pd.to_numeric(_pick(record, "L", "Low"), errors="coerce"),
+                "Close": pd.to_numeric(_pick(record, "C", "Close"), errors="coerce"),
+                "Volume": pd.to_numeric(_pick(record, "Vo", "Volume"), errors="coerce"),
+                "Value": pd.to_numeric(_pick(record, "Va", "Value"), errors="coerce"),
+            }
+        )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=columns), "分足APIの応答を解析できませんでした", True
+    frame = frame.dropna(subset=["datetime", "Open", "High", "Low", "Close"])
+    frame = frame.set_index("datetime").sort_index()
+    frame.index = pd.DatetimeIndex(frame.index).tz_localize(None)
+    frame = frame[~frame.index.duplicated(keep="last")]
+    failed = f"・失敗{len(failed_dates)}日" if failed_dates else ""
+    return frame[columns], f"J-Quants分足API: {len(frame):,}本・{len(set(frame.index.date))}日{failed}", True
+
+
+def intraday_candidate_dates(prices: pd.DataFrame, events: pd.DataFrame) -> tuple[str, ...]:
+    if events.empty:
+        return tuple()
+    trading_days = set(prices.index.normalize())
+    dates: list[str] = []
+    for _, event in events.iterrows():
+        day = pd.Timestamp(event["earnings_date"]).normalize()
+        clock = normalize_clock(event.get("announcement_time", ""))
+        session, strategy = classify_announcement(day, clock, day in trading_days)
+        if strategy == "場中分析対象" and session in {"前場中", "昼休み", "後場中"}:
+            dates.append(day.strftime("%Y-%m-%d"))
+    return tuple(sorted(set(dates)))
 
 
 # -----------------------------
@@ -552,53 +662,19 @@ def summarize_intraday(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
 # UI
 # -----------------------------
 st.title("📊 日本株 決算トレーダー分析")
-st.caption("引け後決算のオーバーナイト分析と、場中決算の発表直後〜引けまでの反応分析を1つに統合します。")
+st.caption("銘柄コードだけで決算日時・日足反応を自動分析。分足アドオンが使える場合は場中反応も自動取得し、未契約時はCSVで補完できます。")
 
 with st.sidebar:
     st.header("分析条件")
     raw_code = st.text_input("銘柄コード", value="7203", max_chars=8)
     years = st.slider("決算取得年数", 2, 10, 2)
     flat_threshold = st.number_input("横ばい判定幅（±%）", 0.0, 2.0, 0.2, 0.1)
+    st.caption("Freeプランは取得期間・遅延の制限があります。")
 
-st.markdown("## ① 分足CSVを選択（場中分析をする場合）")
+st.markdown("## 分析モード")
 st.info(
-    "引け後決算の分析だけならCSVなしでも使えます。場中決算の5分後・30分後・引け反応を調べる場合は、1分足または5分足CSVを選択してください。"
+    "通常は銘柄コードを入力して『分析する』だけです。J-Quants分足アドオンが有効なら場中分析まで自動化します。未契約の場合だけ、後からCSV補完欄が表示されます。"
 )
-
-left_upload, right_help = st.columns([2, 1])
-with left_upload:
-    intraday_file = st.file_uploader(
-        "📁 1分足・5分足CSVをここで選択",
-        type=["csv"],
-        help="datetime, open, high, low, close, volume の形式を推奨します。",
-        key="intraday_csv_main",
-    )
-    if intraday_file is not None:
-        st.success(f"CSVを選択しました：{intraday_file.name}")
-    else:
-        st.caption("未選択：引け後分析のみ実行できます。")
-
-with right_help:
-    sample_csv = (
-        "datetime,open,high,low,close,volume\n"
-        "2025-08-07 13:20:00,2500,2505,2498,2503,120000\n"
-        "2025-08-07 13:25:00,2503,2520,2501,2518,450000\n"
-    )
-    st.download_button(
-        "⬇️ CSVテンプレート",
-        data=sample_csv.encode("utf-8-sig"),
-        file_name="sample_intraday.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    with st.expander("対応する列名"):
-        st.markdown(
-            "- 英語：`datetime, open, high, low, close, volume`\n"
-            "- 日本語：`日時, 始値, 高値, 安値, 終値, 出来高`\n"
-            "- 日本時間・時刻の古い順を推奨"
-        )
-
-st.markdown("## ② 分析を開始")
 run = st.button("分析する", type="primary", use_container_width=True)
 
 if run:
@@ -608,7 +684,7 @@ if run:
         api_key = str(st.secrets.get("JQUANTS_API_KEY", "")).strip()
         cutoff = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize() - pd.DateOffset(years=years)
 
-        with st.spinner("決算日時と株価を集計しています…"):
+        with st.spinner("決算日時・日足・分足の利用可否を確認しています…"):
             prices = load_daily_prices(ticker, years)
             events, jq_status = load_jquants_earnings(code, api_key)
             events = events[
@@ -617,108 +693,180 @@ if run:
             ].copy()
             daily_detail = analyze_daily_events(prices, events, flat_threshold)
             carry_summary = summarize_daily(daily_detail, "決算跨ぎ対象")
-            intraday_bars, intraday_status = parse_intraday_csv(intraday_file)
-            intraday_detail = analyze_intraday_events(intraday_bars, events) if not intraday_bars.empty else pd.DataFrame()
-            intraday_summary, pattern_summary = summarize_intraday(intraday_detail)
+            candidate_dates = intraday_candidate_dates(prices, events)
+            auto_bars, minute_status, addon_available = load_jquants_minute_bars(
+                code, api_key, candidate_dates
+            )
+            auto_intraday_detail = analyze_intraday_events(auto_bars, events) if not auto_bars.empty else pd.DataFrame()
+            auto_intraday_summary, auto_pattern_summary = summarize_intraday(auto_intraday_detail)
 
-        st.subheader(f"{code}（{ticker}）分析結果")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("採用決算", f"{len(daily_detail)}件")
-        c2.metric("引け後・休場日", f"{int((daily_detail['分析区分'] == '決算跨ぎ対象').sum()) if not daily_detail.empty else 0}件")
-        c3.metric("場中・昼休み", f"{int((daily_detail['分析区分'] == '場中分析対象').sum()) if not daily_detail.empty else 0}件")
-        c4.metric("場中CSV一致", f"{len(intraday_detail)}件")
-
-        with st.expander("取得状況"):
-            st.write(f"- {jq_status}")
-            st.write(f"- 日足最新日: {prices.index.max().strftime('%Y-%m-%d')}")
-            st.write(f"- 場中データ: {intraday_status}")
-
-        tab1, tab2, tab3 = st.tabs(["🔵 場中決算分析", "🟢 引け後決算分析", "📋 全決算明細"])
-
-        with tab1:
-            st.markdown("## 場中決算：発表直後から引けまで")
-            if intraday_file is None:
-                st.warning("場中分析には1分足または5分足CSVを選択してください。決算日時は自動取得済みです。")
-            elif intraday_detail.empty:
-                st.warning(
-                    "CSVと決算発表日が一致しませんでした。CSVに対象日の分足が含まれるか、日時列が日本時間か確認してください。"
-                )
-            else:
-                top = intraday_summary.iloc[0]
-                st.success(
-                    f"場中反応最上位：{top['四半期']}｜件数 {int(top['件数'])}｜"
-                    f"5分後上昇率 {top['5分後上昇率(%)']:.1f}%｜"
-                    f"引け上昇率 {top['引け上昇率(%)']:.1f}%｜"
-                    f"平均引け {top['平均引け時点(%)']:+.2f}%｜確信度 {top['確信度']}"
-                )
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("発表5分後 上昇率", f"{intraday_detail['初動プラス'].mean()*100:.1f}%")
-                m2.metric("引けまで上昇率", f"{intraday_detail['引けプラス'].mean()*100:.1f}%")
-                m3.metric("初動継続率", f"{intraday_detail['初動継続'].mean()*100:.1f}%")
-                m4.metric("飛び乗り→引け平均", pct(intraday_detail['発表後初値→引け(%)'].mean()))
-
-                st.markdown("### 四半期別の場中反応")
-                display = intraday_summary.copy()
-                num = display.select_dtypes(include=[np.number]).columns
-                display[num] = display[num].round(2)
-                st.dataframe(display, use_container_width=True, hide_index=True)
-
-                st.markdown("### 反応パターン")
-                pdisplay = pattern_summary.copy()
-                pdisplay["構成比(%)"] = pdisplay["構成比(%)"].round(1)
-                st.dataframe(pdisplay, use_container_width=True, hide_index=True)
-                st.bar_chart(pdisplay.set_index("反応パターン")["件数"])
-
-                st.markdown("### 決算ごとの場中明細")
-                ddisplay = intraday_detail.sort_values("決算発表日", ascending=False).copy()
-                num = ddisplay.select_dtypes(include=[np.number]).columns
-                ddisplay[num] = ddisplay[num].round(2)
-                st.dataframe(ddisplay, use_container_width=True, hide_index=True)
-
-                st.download_button(
-                    "場中分析CSVをダウンロード",
-                    intraday_detail.to_csv(index=False).encode("utf-8-sig"),
-                    f"{code}_intraday_earnings.csv",
-                    "text/csv",
-                    use_container_width=True,
-                )
-
-        with tab2:
-            st.markdown("## 引け後決算：翌営業日のGU・終値")
-            if carry_summary.empty:
-                st.warning("取得期間内に引け後・休場日発表がないか、件数が不足しています。")
-            else:
-                best = carry_summary.iloc[0]
-                st.success(
-                    f"決算跨ぎ最上位：{best['四半期']}｜評価 {best['評価']}｜"
-                    f"勝率 {best['勝率(%)']:.1f}%｜GU率 {best['GU率(%)']:.1f}%｜"
-                    f"平均翌日終値 {best['平均翌日終値(%)']:+.2f}%｜確信度 {best['確信度']}"
-                )
-                display = carry_summary.copy()
-                num = display.select_dtypes(include=[np.number]).columns
-                display[num] = display[num].round(2)
-                st.dataframe(display, use_container_width=True, hide_index=True)
-
-        with tab3:
-            st.markdown("## 決算日時・日足反応一覧")
-            if daily_detail.empty:
-                st.error("分析可能な決算データがありません。")
-            else:
-                display = daily_detail.sort_values("決算発表日", ascending=False).copy()
-                num = display.select_dtypes(include=[np.number]).columns
-                display[num] = display[num].round(2)
-                st.dataframe(display, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "全決算明細CSVをダウンロード",
-                    daily_detail.to_csv(index=False).encode("utf-8-sig"),
-                    f"{code}_earnings_all.csv",
-                    "text/csv",
-                    use_container_width=True,
-                )
-
+        st.session_state["analysis_bundle"] = {
+            "code": code,
+            "ticker": ticker,
+            "events": events,
+            "prices": prices,
+            "daily_detail": daily_detail,
+            "carry_summary": carry_summary,
+            "jq_status": jq_status,
+            "candidate_dates": candidate_dates,
+            "auto_bars": auto_bars,
+            "minute_status": minute_status,
+            "addon_available": addon_available,
+            "auto_intraday_detail": auto_intraday_detail,
+            "auto_intraday_summary": auto_intraday_summary,
+            "auto_pattern_summary": auto_pattern_summary,
+        }
     except Exception as exc:
         st.error(f"処理中にエラーが発生しました: {exc}")
+
+bundle = st.session_state.get("analysis_bundle")
+if bundle:
+    code = bundle["code"]
+    ticker = bundle["ticker"]
+    events = bundle["events"]
+    prices = bundle["prices"]
+    daily_detail = bundle["daily_detail"]
+    carry_summary = bundle["carry_summary"]
+    candidate_dates = bundle["candidate_dates"]
+    auto_intraday_detail = bundle["auto_intraday_detail"]
+    auto_intraday_summary = bundle["auto_intraday_summary"]
+    auto_pattern_summary = bundle["auto_pattern_summary"]
+    addon_available = bundle["addon_available"]
+
+    st.subheader(f"{code}（{ticker}）分析結果")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("採用決算", f"{len(daily_detail)}件")
+    c2.metric("引け後・休場日", f"{int((daily_detail['分析区分'] == '決算跨ぎ対象').sum()) if not daily_detail.empty else 0}件")
+    c3.metric("場中・昼休み", f"{int((daily_detail['分析区分'] == '場中分析対象').sum()) if not daily_detail.empty else 0}件")
+    c4.metric("自動分足一致", f"{len(auto_intraday_detail)}件")
+
+    with st.expander("取得状況", expanded=True):
+        st.write(f"- {bundle['jq_status']}")
+        st.write(f"- 日足最新日: {prices.index.max().strftime('%Y-%m-%d')}")
+        st.write(f"- 場中候補日: {len(candidate_dates)}日")
+        st.write(f"- {bundle['minute_status']}")
+
+    csv_intraday_detail = pd.DataFrame()
+    csv_intraday_summary = pd.DataFrame()
+    csv_pattern_summary = pd.DataFrame()
+    csv_status = "CSV未選択"
+
+    if auto_intraday_detail.empty:
+        if addon_available:
+            st.warning("分足APIは利用できますが、取得期間内の対象日に分足がありませんでした。必要ならCSVで補完してください。")
+        else:
+            st.warning("分足アドオン未契約のため、場中5分後・30分後・引け反応はCSV補完で分析できます。引け後分析は完全自動です。")
+
+        with st.expander("📁 場中分足CSVで補完する（任意）", expanded=False):
+            uploaded = st.file_uploader(
+                "1分足・5分足CSVを選択",
+                type=["csv"],
+                help="datetime, open, high, low, close, volume の形式を推奨します。",
+                key=f"fallback_csv_{code}",
+            )
+            sample_csv = (
+                "datetime,open,high,low,close,volume\n"
+                "2025-08-07 13:20:00,2500,2505,2498,2503,120000\n"
+                "2025-08-07 13:25:00,2503,2520,2501,2518,450000\n"
+            )
+            st.download_button(
+                "CSVテンプレート",
+                data=sample_csv.encode("utf-8-sig"),
+                file_name="sample_intraday.csv",
+                mime="text/csv",
+            )
+            if uploaded is not None:
+                try:
+                    csv_bars, csv_status = parse_intraday_csv(uploaded)
+                    csv_intraday_detail = analyze_intraday_events(csv_bars, events)
+                    csv_intraday_summary, csv_pattern_summary = summarize_intraday(csv_intraday_detail)
+                    st.success(f"{uploaded.name} を読み込みました：{csv_status} / 決算一致 {len(csv_intraday_detail)}件")
+                except Exception as exc:
+                    st.error(f"CSV解析エラー: {exc}")
+
+    intraday_detail = auto_intraday_detail if not auto_intraday_detail.empty else csv_intraday_detail
+    intraday_summary = auto_intraday_summary if not auto_intraday_detail.empty else csv_intraday_summary
+    pattern_summary = auto_pattern_summary if not auto_intraday_detail.empty else csv_pattern_summary
+    intraday_source = "J-Quants分足API（自動）" if not auto_intraday_detail.empty else ("CSV補完" if not csv_intraday_detail.empty else "未取得")
+
+    tab1, tab2, tab3 = st.tabs(["🔵 場中決算分析", "🟢 引け後決算分析", "📋 全決算明細"])
+
+    with tab1:
+        st.markdown("## 場中決算：発表直後から引けまで")
+        st.caption(f"分足データ源：{intraday_source}")
+        if intraday_detail.empty:
+            st.info("分足データがないため、場中の5分後・30分後・引け反応は未分析です。引け後分析と発表時刻分類は利用できます。")
+        else:
+            top = intraday_summary.iloc[0]
+            st.success(
+                f"場中反応最上位：{top['四半期']}｜件数 {int(top['件数'])}｜"
+                f"5分後上昇率 {top['5分後上昇率(%)']:.1f}%｜"
+                f"引け上昇率 {top['引け上昇率(%)']:.1f}%｜"
+                f"平均引け {top['平均引け時点(%)']:+.2f}%｜確信度 {top['確信度']}"
+            )
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("発表5分後 上昇率", f"{intraday_detail['初動プラス'].mean()*100:.1f}%")
+            m2.metric("引けまで上昇率", f"{intraday_detail['引けプラス'].mean()*100:.1f}%")
+            m3.metric("初動継続率", f"{intraday_detail['初動継続'].mean()*100:.1f}%")
+            m4.metric("飛び乗り→引け平均", pct(intraday_detail['発表後初値→引け(%)'].mean()))
+
+            st.markdown("### 四半期別の場中反応")
+            display = intraday_summary.copy()
+            num = display.select_dtypes(include=[np.number]).columns
+            display[num] = display[num].round(2)
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            st.markdown("### 反応パターン")
+            pdisplay = pattern_summary.copy()
+            pdisplay["構成比(%)"] = pdisplay["構成比(%)"].round(1)
+            st.dataframe(pdisplay, use_container_width=True, hide_index=True)
+            st.bar_chart(pdisplay.set_index("反応パターン")["件数"])
+
+            st.markdown("### 決算ごとの場中明細")
+            ddisplay = intraday_detail.sort_values("決算発表日", ascending=False).copy()
+            num = ddisplay.select_dtypes(include=[np.number]).columns
+            ddisplay[num] = ddisplay[num].round(2)
+            st.dataframe(ddisplay, use_container_width=True, hide_index=True)
+            st.download_button(
+                "場中分析CSVをダウンロード",
+                intraday_detail.to_csv(index=False).encode("utf-8-sig"),
+                f"{code}_intraday_earnings.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+
+    with tab2:
+        st.markdown("## 引け後決算：翌営業日のGU・終値")
+        if carry_summary.empty:
+            st.warning("取得期間内に引け後・休場日発表がないか、件数が不足しています。")
+        else:
+            best = carry_summary.iloc[0]
+            st.success(
+                f"決算跨ぎ最上位：{best['四半期']}｜評価 {best['評価']}｜"
+                f"勝率 {best['勝率(%)']:.1f}%｜GU率 {best['GU率(%)']:.1f}%｜"
+                f"平均翌日終値 {best['平均翌日終値(%)']:+.2f}%｜確信度 {best['確信度']}"
+            )
+            display = carry_summary.copy()
+            num = display.select_dtypes(include=[np.number]).columns
+            display[num] = display[num].round(2)
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.markdown("## 決算日時・日足反応一覧")
+        if daily_detail.empty:
+            st.error("分析可能な決算データがありません。")
+        else:
+            display = daily_detail.sort_values("決算発表日", ascending=False).copy()
+            num = display.select_dtypes(include=[np.number]).columns
+            display[num] = display[num].round(2)
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.download_button(
+                "全決算明細CSVをダウンロード",
+                daily_detail.to_csv(index=False).encode("utf-8-sig"),
+                f"{code}_earnings_all.csv",
+                "text/csv",
+                use_container_width=True,
+            )
 
 with st.expander("場中パターンの定義"):
     st.markdown(
