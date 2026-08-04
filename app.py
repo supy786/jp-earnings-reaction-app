@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import timedelta
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="日本株 決算翌営業日分析", page_icon="📊", layout="wide")
+st.set_page_config(page_title="日本株 決算四半期リアクション分析", page_icon="📊", layout="wide")
+
+USER_AGENT = (
+    "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+)
+VALID_QUARTERS = {"1Q", "2Q", "3Q", "本決算"}
 
 
 @dataclass(frozen=True)
@@ -24,8 +33,8 @@ def normalize_code(raw: str) -> str:
     code = raw.strip().upper().replace(".T", "")
     if not code:
         raise ValueError("銘柄コードを入力してください。")
-    if not code.isalnum():
-        raise ValueError("銘柄コードは半角英数字で入力してください。")
+    if not re.fullmatch(r"[0-9A-Z]{4,6}", code):
+        raise ValueError("銘柄コードは半角英数字4〜6文字で入力してください。")
     return code
 
 
@@ -35,8 +44,9 @@ def to_tse_ticker(code: str) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_prices(ticker: str, years: int) -> pd.DataFrame:
-    start = pd.Timestamp.today(tz="Asia/Tokyo").tz_localize(None) - pd.DateOffset(years=years, months=8)
-    end = pd.Timestamp.today(tz="Asia/Tokyo").tz_localize(None) + pd.Timedelta(days=2)
+    today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
+    start = today - pd.DateOffset(years=years, months=9)
+    end = today + pd.Timedelta(days=3)
     df = yf.download(
         ticker,
         start=start.strftime("%Y-%m-%d"),
@@ -46,7 +56,7 @@ def load_prices(ticker: str, years: int) -> pd.DataFrame:
         threads=False,
     )
     if df.empty:
-        raise RuntimeError("株価データを取得できませんでした。コードまたは通信状況を確認してください。")
+        raise RuntimeError("株価データを取得できませんでした。銘柄コードまたは通信状況を確認してください。")
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     required = ["Open", "High", "Low", "Close", "Volume"]
@@ -59,27 +69,74 @@ def load_prices(ticker: str, years: int) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_auto_earnings(ticker: str, limit: int) -> pd.DataFrame:
-    obj = yf.Ticker(ticker)
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_irbank_earnings(code: str) -> tuple[pd.DataFrame, str]:
+    """IRBANKの決算発表履歴ページから日付を抽出する。
+
+    HTML構造変更時は空データを返し、他ソースへフォールバックする。
+    ページ自体が決算発表履歴のため、抽出した日付候補を使用するが、
+    未来日と古すぎる日付は後段で除外する。
+    """
+    url = f"https://irbank.net/{code}/pl"
     try:
-        df = obj.get_earnings_dates(limit=limit)
-    except Exception:
-        return pd.DataFrame(columns=["earnings_date", "source"])
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
+        r.raise_for_status()
+    except Exception as exc:
+        return pd.DataFrame(columns=["earnings_date", "source"]), f"IRBANK取得失敗: {type(exc).__name__}"
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    date_tokens = set()
+
+    patterns = [
+        r"(?<!\d)(20\d{2})[/-](\d{1,2})[/-](\d{1,2})(?!\d)",
+        r"(?<!\d)(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日",
+    ]
+    for pattern in patterns:
+        for y, m, d in re.findall(pattern, text):
+            try:
+                date_tokens.add(pd.Timestamp(year=int(y), month=int(m), day=int(d)).normalize())
+            except ValueError:
+                pass
+
+    # hrefやtime要素に日付が入るケースも拾う
+    for tag in soup.find_all(["time", "a", "td", "span"]):
+        candidate = " ".join(filter(None, [tag.get("datetime"), tag.get("href"), tag.get_text(" ", strip=True)]))
+        for pattern in patterns:
+            for y, m, d in re.findall(pattern, candidate):
+                try:
+                    date_tokens.add(pd.Timestamp(year=int(y), month=int(m), day=int(d)).normalize())
+                except ValueError:
+                    pass
+
+    if not date_tokens:
+        return pd.DataFrame(columns=["earnings_date", "source"]), "IRBANK: 日付候補0件"
+
+    result = pd.DataFrame({"earnings_date": sorted(date_tokens)})
+    result["source"] = "IRBANK 決算発表履歴"
+    return result, f"IRBANK: {len(result)}件抽出"
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_yahoo_earnings(ticker: str, limit: int) -> tuple[pd.DataFrame, str]:
+    try:
+        df = yf.Ticker(ticker).get_earnings_dates(limit=limit)
+    except Exception as exc:
+        return pd.DataFrame(columns=["earnings_date", "source"]), f"Yahoo取得失敗: {type(exc).__name__}"
     if df is None or df.empty:
-        return pd.DataFrame(columns=["earnings_date", "source"])
+        return pd.DataFrame(columns=["earnings_date", "source"]), "Yahoo Finance: 0件"
     idx = pd.to_datetime(df.index, errors="coerce")
     if getattr(idx, "tz", None) is not None:
         idx = idx.tz_convert("Asia/Tokyo").tz_localize(None)
-    result = pd.DataFrame({"earnings_date": idx.normalize()})
-    result = result.dropna().drop_duplicates("earnings_date").sort_values("earnings_date")
-    result["source"] = "Yahoo Finance 自動取得"
-    return result.reset_index(drop=True)
+    result = pd.DataFrame({"earnings_date": idx.normalize()}).dropna().drop_duplicates()
+    result["source"] = "Yahoo Finance 決算日"
+    return result.sort_values("earnings_date").reset_index(drop=True), f"Yahoo Finance: {len(result)}件"
 
 
 def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
+    cols = ["earnings_date", "quarter", "announcement_time", "source"]
     if uploaded_file is None:
-        return pd.DataFrame(columns=["earnings_date", "quarter", "announcement_time", "source"])
+        return pd.DataFrame(columns=cols)
     raw = uploaded_file.getvalue()
     decoded = None
     for enc in ("utf-8-sig", "cp932", "utf-8"):
@@ -89,7 +146,7 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
         except UnicodeDecodeError:
             continue
     if decoded is None:
-        raise ValueError("CSVの文字コードを読み取れませんでした。UTF-8またはShift-JISを使用してください。")
+        raise ValueError("CSVの文字コードを読み取れません。UTF-8またはShift-JISを使用してください。")
     df = pd.read_csv(io.StringIO(decoded))
     if "earnings_date" not in df.columns:
         raise ValueError("CSVには earnings_date 列が必要です。")
@@ -98,12 +155,11 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
     out["quarter"] = df["quarter"].astype(str) if "quarter" in df.columns else ""
     out["announcement_time"] = df["announcement_time"].astype(str) if "announcement_time" in df.columns else ""
     out["source"] = df["source"].astype(str) if "source" in df.columns else "CSV"
-    out = out.dropna(subset=["earnings_date"])
-    return out
+    return out.dropna(subset=["earnings_date"])
 
 
 def parse_manual_dates(text: str) -> pd.DataFrame:
-    rows: list[dict] = []
+    rows = []
     for line in text.splitlines():
         value = line.strip()
         if not value:
@@ -112,113 +168,140 @@ def parse_manual_dates(text: str) -> pd.DataFrame:
         dt = pd.to_datetime(parts[0], errors="coerce")
         if pd.isna(dt):
             continue
-        rows.append(
-            {
-                "earnings_date": dt.normalize(),
-                "quarter": parts[1] if len(parts) >= 2 else "",
-                "announcement_time": parts[2] if len(parts) >= 3 else "",
-                "source": "手入力",
-            }
-        )
+        rows.append({
+            "earnings_date": dt.normalize(),
+            "quarter": parts[1] if len(parts) >= 2 else "",
+            "announcement_time": parts[2] if len(parts) >= 3 else "",
+            "source": "手入力",
+        })
     return pd.DataFrame(rows, columns=["earnings_date", "quarter", "announcement_time", "source"])
 
 
 def infer_quarter(announcement_date: pd.Timestamp, fiscal_year_end_month: int) -> str:
-    # 発表日より20～150日前にある四半期末候補のうち、最も近い日を対象期間末とみなす。
-    candidates: list[pd.Timestamp] = []
+    candidates = []
+    quarter_end_months = {
+        fiscal_year_end_month,
+        ((fiscal_year_end_month - 3 - 1) % 12) + 1,
+        ((fiscal_year_end_month - 6 - 1) % 12) + 1,
+        ((fiscal_year_end_month - 9 - 1) % 12) + 1,
+    }
     for year in range(announcement_date.year - 2, announcement_date.year + 1):
-        for month in range(1, 13):
-            if month in {
-                fiscal_year_end_month,
-                ((fiscal_year_end_month - 3 - 1) % 12) + 1,
-                ((fiscal_year_end_month - 6 - 1) % 12) + 1,
-                ((fiscal_year_end_month - 9 - 1) % 12) + 1,
-            }:
-                candidates.append(pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0))
-    valid = [d for d in candidates if timedelta(days=20) <= announcement_date - d <= timedelta(days=150)]
+        for month in quarter_end_months:
+            candidates.append(pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0))
+    valid = [d for d in candidates if timedelta(days=15) <= announcement_date - d <= timedelta(days=155)]
     if not valid:
         return "不明"
     period_end = max(valid)
     months_back = (fiscal_year_end_month - period_end.month) % 12
-    mapping = {0: "本決算", 9: "1Q", 6: "2Q", 3: "3Q"}
-    return mapping.get(months_back, "不明")
+    return {0: "本決算", 9: "1Q", 6: "2Q", 3: "3Q"}.get(months_back, "不明")
 
 
-def combine_earnings(auto: pd.DataFrame, uploaded: pd.DataFrame, manual: pd.DataFrame,
-                      fy_end_month: int, cutoff: pd.Timestamp) -> pd.DataFrame:
+def is_plausible_earnings_date(dt: pd.Timestamp, fy_end_month: int) -> bool:
+    """発表月として極端に不自然な日付を除外する緩いフィルタ。"""
+    q = infer_quarter(dt, fy_end_month)
+    return q in VALID_QUARTERS
+
+
+def combine_earnings(
+    irbank: pd.DataFrame,
+    yahoo: pd.DataFrame,
+    uploaded: pd.DataFrame,
+    manual: pd.DataFrame,
+    fy_end_month: int,
+    cutoff: pd.Timestamp,
+    latest_price_date: pd.Timestamp,
+) -> pd.DataFrame:
     frames = []
-    if not auto.empty:
-        a = auto.copy()
-        a["quarter"] = ""
-        a["announcement_time"] = ""
-        frames.append(a)
+    for frame in (irbank, yahoo):
+        if not frame.empty:
+            f = frame.copy()
+            f["quarter"] = ""
+            f["announcement_time"] = ""
+            frames.append(f)
     if not uploaded.empty:
         frames.append(uploaded)
     if not manual.empty:
         frames.append(manual)
     if not frames:
         return pd.DataFrame(columns=["earnings_date", "quarter", "announcement_time", "source"])
+
     all_dates = pd.concat(frames, ignore_index=True)
-    all_dates["earnings_date"] = pd.to_datetime(all_dates["earnings_date"]).dt.normalize()
-    all_dates = all_dates[all_dates["earnings_date"] >= cutoff]
-    # 同じ日付は手入力 > CSV > 自動取得の順で優先
-    priority = {"手入力": 3, "CSV": 2, "Yahoo Finance 自動取得": 1}
-    all_dates["_priority"] = all_dates["source"].map(priority).fillna(2)
-    all_dates = all_dates.sort_values(["earnings_date", "_priority"]).drop_duplicates("earnings_date", keep="last")
+    all_dates["earnings_date"] = pd.to_datetime(all_dates["earnings_date"], errors="coerce").dt.normalize()
+    all_dates = all_dates.dropna(subset=["earnings_date"])
+    all_dates = all_dates[
+        (all_dates["earnings_date"] >= cutoff)
+        & (all_dates["earnings_date"] <= latest_price_date)
+    ]
+
+    # 自動取得日は、決算発表時期として成立する候補だけ残す。
+    manual_sources = {"手入力", "CSV"}
+    auto_mask = ~all_dates["source"].astype(str).isin(manual_sources)
+    all_dates = all_dates[(~auto_mask) | all_dates["earnings_date"].map(lambda x: is_plausible_earnings_date(x, fy_end_month))]
+
+    priority = {
+        "手入力": 40,
+        "CSV": 30,
+        "IRBANK 決算発表履歴": 20,
+        "Yahoo Finance 決算日": 10,
+    }
+    all_dates["_priority"] = all_dates["source"].map(priority).fillna(15)
+    all_dates = (
+        all_dates.sort_values(["earnings_date", "_priority"])
+        .drop_duplicates("earnings_date", keep="last")
+    )
     all_dates["quarter"] = all_dates.apply(
-        lambda r: r["quarter"] if str(r["quarter"]).strip() in {"1Q", "2Q", "3Q", "本決算"}
-        else infer_quarter(r["earnings_date"], fy_end_month), axis=1
+        lambda r: r["quarter"] if str(r["quarter"]).strip() in VALID_QUARTERS
+        else infer_quarter(r["earnings_date"], fy_end_month),
+        axis=1,
     )
     return all_dates.drop(columns="_priority").sort_values("earnings_date").reset_index(drop=True)
 
 
-def next_trading_day(index: pd.DatetimeIndex, target: pd.Timestamp, strictly_after: bool = False):
-    pos = index.searchsorted(target, side="right" if strictly_after else "left")
-    if pos >= len(index):
-        return None
-    return index[pos]
+def trading_day_at_or_after(index: pd.DatetimeIndex, target: pd.Timestamp):
+    pos = index.searchsorted(target, side="left")
+    return None if pos >= len(index) else index[pos]
 
 
 def analyze_events(prices: pd.DataFrame, events: pd.DataFrame, flat_threshold: float) -> pd.DataFrame:
-    rows: list[dict] = []
+    rows = []
     idx = prices.index
     for _, event in events.iterrows():
         announced = pd.Timestamp(event["earnings_date"]).normalize()
-        event_day = next_trading_day(idx, announced, strictly_after=False)
+        event_day = trading_day_at_or_after(idx, announced)
         if event_day is None:
             continue
-        # 土日発表などは、最初の取引日を「当日扱い」にせず注記する。
-        is_same_calendar_day = event_day == announced
-        prev_pos = idx.get_loc(event_day) - 1
-        next_pos = idx.get_loc(event_day) + 1
-        if prev_pos < 0 or next_pos >= len(idx):
+        same_calendar_day = event_day == announced
+        pos = idx.get_loc(event_day)
+        if pos < 1 or pos + 1 >= len(idx):
             continue
-        prev_day = idx[prev_pos]
-        next_day = idx[next_pos]
+        prev_day, next_day = idx[pos - 1], idx[pos + 1]
         prev_close = float(prices.loc[prev_day, "Close"])
         event_open = float(prices.loc[event_day, "Open"])
         event_close = float(prices.loc[event_day, "Close"])
         next_open = float(prices.loc[next_day, "Open"])
         next_close = float(prices.loc[next_day, "Close"])
+
         event_change = (event_close / prev_close - 1) * 100
-        next_change_vs_event_close = (next_close / event_close - 1) * 100
-        next_change_vs_preclose = (next_close / prev_close - 1) * 100
+        next_change = (next_close / event_close - 1) * 100
+        next_total = (next_close / prev_close - 1) * 100
         gu = (next_open / event_close - 1) * 100
-        reaction = "上昇" if next_change_vs_event_close > flat_threshold else (
-            "下落" if next_change_vs_event_close < -flat_threshold else "横ばい"
-        )
+        intraday = (next_close / next_open - 1) * 100
+        reaction = "上昇" if next_change > flat_threshold else ("下落" if next_change < -flat_threshold else "横ばい")
+
         rows.append({
             "決算発表日": announced.date(),
-            "発表日取引": "通常" if is_same_calendar_day else "休場日発表",
+            "発表日取引": "通常" if same_calendar_day else "休場日発表",
             "四半期": event["quarter"],
-            "発表時刻": event.get("announcement_time", "") or "不明",
+            "発表時刻": str(event.get("announcement_time", "")).strip() or "不明",
             "データ源": event["source"],
+            "前営業日": prev_day.date(),
             "当日取引日": event_day.date(),
             "翌営業日": next_day.date(),
             "決算当日騰落率(%)": event_change,
             "翌日GU率(%)": gu,
-            "翌日騰落率(前日終値比)(%)": next_change_vs_event_close,
-            "決算前終値→翌日終値(%)": next_change_vs_preclose,
+            "翌日寄り後騰落率(%)": intraday,
+            "翌日終値騰落率(%)": next_change,
+            "決算前終値→翌日終値(%)": next_total,
             "翌日判定": reaction,
             "当日出来高": int(prices.loc[event_day, "Volume"]),
             "翌日出来高": int(prices.loc[next_day, "Volume"]),
@@ -229,7 +312,6 @@ def analyze_events(prices: pd.DataFrame, events: pd.DataFrame, flat_threshold: f
 def summarize(detail: pd.DataFrame) -> pd.DataFrame:
     if detail.empty:
         return pd.DataFrame()
-    order = ["1Q", "2Q", "3Q", "本決算", "不明"]
     rows = []
     for q, g in detail.groupby("四半期", dropna=False):
         n = len(g)
@@ -247,11 +329,13 @@ def summarize(detail: pd.DataFrame) -> pd.DataFrame:
             "平均・翌日GU率(%)": g["翌日GU率(%)"].mean(),
             "GU回数": int((g["翌日GU率(%)"] > 0).sum()),
             "GU率(%)": (g["翌日GU率(%)"] > 0).mean() * 100,
-            "平均・翌日騰落率(%)": g["翌日騰落率(前日終値比)(%)"].mean(),
-            "中央値・翌日騰落率(%)": g["翌日騰落率(前日終値比)(%)"].median(),
+            "平均・翌日寄り後(%)": g["翌日寄り後騰落率(%)"].mean(),
+            "平均・翌日終値騰落率(%)": g["翌日終値騰落率(%)"].mean(),
+            "中央値・翌日終値騰落率(%)": g["翌日終値騰落率(%)"].median(),
         })
     result = pd.DataFrame(rows)
-    result["_order"] = result["四半期"].map({v: i for i, v in enumerate(order)}).fillna(99)
+    order = {"1Q": 0, "2Q": 1, "3Q": 2, "本決算": 3, "不明": 9}
+    result["_order"] = result["四半期"].map(order).fillna(99)
     return result.sort_values("_order").drop(columns="_order").reset_index(drop=True)
 
 
@@ -259,96 +343,112 @@ def score_quarters(summary: pd.DataFrame) -> pd.DataFrame:
     if summary.empty:
         return summary
     out = summary.copy()
-    # 小標本の過大評価を抑えるため、件数による信頼係数を付ける。
-    reliability = np.minimum(out["件数"] / 5.0, 1.0)
+    reliability = np.minimum(out["件数"] / 6.0, 1.0)
     raw = (
-        out["平均・翌日騰落率(%)"] * 0.45
-        + out["中央値・翌日騰落率(%)"] * 0.20
-        + (out["上昇率(%)"] - 50) / 10 * 0.20
-        + (out["GU率(%)"] - 50) / 10 * 0.15
+        out["平均・翌日終値騰落率(%)"] * 0.40
+        + out["中央値・翌日終値騰落率(%)"] * 0.20
+        + out["平均・翌日GU率(%)"] * 0.20
+        + (out["上昇率(%)"] - 50) / 10 * 0.12
+        + (out["GU率(%)"] - 50) / 10 * 0.08
     ) * reliability
     out["参考スコア"] = raw.round(2)
-    rank = raw.rank(method="min", ascending=False)
-    out["決算跨ぎ評価"] = rank.map(lambda r: "S" if r == 1 else ("A" if r == 2 else ("B" if r == 3 else "C")))
+
+    eligible = out["四半期"].isin(VALID_QUARTERS)
+    ranks = out.loc[eligible, "参考スコア"].rank(method="min", ascending=False)
+    out["決算跨ぎ評価"] = "—"
+    out.loc[eligible, "決算跨ぎ評価"] = ranks.map(lambda r: "S" if r == 1 else ("A" if r == 2 else ("B" if r == 3 else "C")))
     out["確信度"] = out["件数"].map(lambda n: "高" if n >= 8 else ("中" if n >= 5 else "低"))
     return out
 
 
+def source_counts(events: pd.DataFrame) -> str:
+    if events.empty:
+        return "なし"
+    counts = events["source"].value_counts()
+    return " / ".join(f"{name}: {count}件" for name, count in counts.items())
+
+
 st.title("📊 日本株 決算当日・翌営業日リアクション分析")
-st.caption("銘柄コードを入力すると、過去の決算発表日と日足を突合し、四半期別の短期反応を集計します。")
+st.caption("銘柄コードだけで決算発表日候補と日足を突合し、1Q・2Q・3Q・本決算ごとの短期反応を集計します。")
 
 with st.sidebar:
     st.header("分析条件")
     raw_code = st.text_input("銘柄コード", value="4203", max_chars=8)
-    years = st.slider("分析年数", min_value=2, max_value=10, value=8)
-    fy_end_month = st.selectbox("決算月", options=list(range(1, 13)), index=2, format_func=lambda x: f"{x}月")
-    flat_threshold = st.number_input("横ばい判定幅（±%）", min_value=0.0, max_value=2.0, value=0.2, step=0.1)
+    years = st.slider("分析年数", 2, 10, 8)
+    fy_end_month = st.selectbox("決算月", list(range(1, 13)), index=2, format_func=lambda x: f"{x}月")
+    flat_threshold = st.number_input("横ばい判定幅（±%）", 0.0, 2.0, 0.2, 0.1)
     st.divider()
-    st.subheader("決算日の補完（任意）")
+    st.subheader("補完データ（任意）")
     uploaded = st.file_uploader("決算日CSV", type=["csv"], help="必須列: earnings_date。任意列: quarter, announcement_time, source")
     manual_text = st.text_area(
         "手入力",
         placeholder="2025-08-05,1Q,15:00\n2025-11-07,2Q,15:00",
-        help="1行1件。日付,四半期,発表時刻 の順。四半期と時刻は省略可能です。",
+        help="日付,四半期,発表時刻。四半期と時刻は省略できます。",
     )
     run = st.button("分析する", type="primary", use_container_width=True)
 
 st.info(
-    "重要：『決算当日騰落率』は前営業日終値→決算発表日の終値です。引け後発表の場合、決算内容を反映する主指標は翌営業日のGU率・騰落率です。発表時刻が不明なデータは因果関係を断定しません。"
+    "決算当日騰落率は前営業日終値→発表日終値です。引け後発表では、決算反応の中心は翌営業日のGU率・終値騰落率です。発表時刻不明データでは因果関係を断定しません。"
 )
 
 if run:
     try:
         code = normalize_code(raw_code)
         ticker = to_tse_ticker(code)
-        settings = Settings(years=years, flat_threshold=flat_threshold, fiscal_year_end_month=fy_end_month)
-        cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=years)
+        cutoff = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize() - pd.DateOffset(years=years)
 
-        with st.spinner("株価と決算日を取得・集計しています…"):
+        with st.spinner("株価・決算発表日を取得して集計しています…"):
             prices = load_prices(ticker, years)
-            auto = load_auto_earnings(ticker, limit=max(40, years * 5))
+            irbank, irbank_status = load_irbank_earnings(code)
+            yahoo, yahoo_status = load_yahoo_earnings(ticker, max(50, years * 6))
             csv_events = parse_uploaded_csv(uploaded)
             manual_events = parse_manual_dates(manual_text)
-            events = combine_earnings(auto, csv_events, manual_events, fy_end_month, cutoff)
+            events = combine_earnings(
+                irbank, yahoo, csv_events, manual_events,
+                fy_end_month, cutoff, prices.index.max(),
+            )
             detail = analyze_events(prices, events, flat_threshold)
             summary = score_quarters(summarize(detail))
 
         st.subheader(f"{code}（{ticker}）分析結果")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("確認できた決算", f"{len(detail)}件")
-        c2.metric("自動取得日", f"{len(auto)}件")
+        c2.metric("決算日候補", f"{len(events)}件")
         c3.metric("分析期間", f"過去{years}年")
         c4.metric("最新株価日", prices.index.max().strftime("%Y-%m-%d"))
 
+        with st.expander("取得状況", expanded=detail.empty):
+            st.write(f"- {irbank_status}")
+            st.write(f"- {yahoo_status}")
+            st.write(f"- 採用データ: {source_counts(events)}")
+            st.caption("IRBANKやYahoo Financeの仕様変更・通信制限時は取得件数が0になることがあります。取得できない日付を推測で追加しません。")
+
         if detail.empty:
-            st.error("分析可能な決算日がありません。CSVまたは手入力で決算日を追加してください。")
+            st.error("分析可能な決算日を自動取得できませんでした。企業IR・TDnetで確認した日付をCSVまたは手入力で追加してください。")
         else:
-            if summary.empty:
-                st.warning("四半期別集計を作成できませんでした。")
-            else:
-                eligible = summary[summary["四半期"].isin(["1Q", "2Q", "3Q", "本決算"])]
-                if not eligible.empty:
-                    best = eligible.sort_values(["参考スコア", "件数"], ascending=False).iloc[0]
-                    worst = eligible.sort_values(["参考スコア", "件数"], ascending=True).iloc[0]
-                    st.success(
-                        f"最も強い四半期（過去データ）：{best['四半期']} / 評価 {best['決算跨ぎ評価']} / "
-                        f"平均翌日騰落率 {best['平均・翌日騰落率(%)']:+.2f}% / 確信度 {best['確信度']}"
-                    )
-                    st.warning(
-                        f"最も弱い四半期（過去データ）：{worst['四半期']} / "
-                        f"平均翌日騰落率 {worst['平均・翌日騰落率(%)']:+.2f}% / 確信度 {worst['確信度']}"
-                    )
+            eligible = summary[summary["四半期"].isin(VALID_QUARTERS)] if not summary.empty else pd.DataFrame()
+            if not eligible.empty:
+                best = eligible.sort_values(["参考スコア", "件数"], ascending=False).iloc[0]
+                worst = eligible.sort_values(["参考スコア", "件数"], ascending=True).iloc[0]
+                st.success(
+                    f"最も強い四半期：{best['四半期']}｜評価 {best['決算跨ぎ評価']}｜"
+                    f"平均翌日終値 {best['平均・翌日終値騰落率(%)']:+.2f}%｜GU率 {best['GU率(%)']:.1f}%｜確信度 {best['確信度']}"
+                )
+                st.warning(
+                    f"最も弱い四半期：{worst['四半期']}｜平均翌日終値 {worst['平均・翌日終値騰落率(%)']:+.2f}%｜"
+                    f"GU率 {worst['GU率(%)']:.1f}%｜確信度 {worst['確信度']}"
+                )
 
-                st.markdown("### 四半期別集計")
-                formatted_summary = summary.copy()
-                numeric_cols = formatted_summary.select_dtypes(include=[np.number]).columns
-                formatted_summary[numeric_cols] = formatted_summary[numeric_cols].round(2)
-                st.dataframe(formatted_summary, use_container_width=True, hide_index=True)
+            st.markdown("### 四半期別集計")
+            display_summary = summary.copy()
+            num_cols = display_summary.select_dtypes(include=[np.number]).columns
+            display_summary[num_cols] = display_summary[num_cols].round(2)
+            st.dataframe(display_summary, use_container_width=True, hide_index=True)
 
-                chart_df = summary[summary["四半期"].isin(["1Q", "2Q", "3Q", "本決算"])].set_index("四半期")
-                if not chart_df.empty:
-                    st.markdown("### 平均反応")
-                    st.bar_chart(chart_df[["平均・翌日GU率(%)", "平均・翌日騰落率(%)"]])
+            chart_df = summary[summary["四半期"].isin(VALID_QUARTERS)].set_index("四半期")
+            if not chart_df.empty:
+                st.markdown("### 平均反応")
+                st.bar_chart(chart_df[["平均・翌日GU率(%)", "平均・翌日終値騰落率(%)"]])
 
             st.markdown("### 決算ごとの明細")
             display = detail.sort_values("決算発表日", ascending=False).copy()
@@ -356,28 +456,29 @@ if run:
             display[pct_cols] = display[pct_cols].round(2)
             st.dataframe(display, use_container_width=True, hide_index=True)
 
-            st.download_button(
+            col1, col2 = st.columns(2)
+            col1.download_button(
                 "明細CSVをダウンロード",
-                data=detail.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{code}_earnings_reaction_detail.csv",
-                mime="text/csv",
+                detail.to_csv(index=False).encode("utf-8-sig"),
+                f"{code}_earnings_reaction_detail.csv",
+                "text/csv",
+                use_container_width=True,
             )
-            st.download_button(
+            col2.download_button(
                 "四半期集計CSVをダウンロード",
-                data=summary.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{code}_earnings_reaction_summary.csv",
-                mime="text/csv",
+                summary.to_csv(index=False).encode("utf-8-sig"),
+                f"{code}_earnings_reaction_summary.csv",
+                "text/csv",
+                use_container_width=True,
             )
 
-            unknown_times = (detail["発表時刻"] == "不明").sum()
-            inferred = (detail["四半期"] == "不明").sum()
             st.markdown("### データ品質")
-            st.write(f"- 発表時刻不明：{unknown_times}件")
-            st.write(f"- 四半期判定不明：{inferred}件")
-            st.write("- 自動取得した決算日は必ず企業IR・TDnetと照合してください。特に発表時刻はYahoo Financeだけでは十分に確認できません。")
+            st.write(f"- 発表時刻不明：{int((detail['発表時刻'] == '不明').sum())}件")
+            st.write(f"- 四半期判定不明：{int((detail['四半期'] == '不明').sum())}件")
+            st.write("- 最終的な決算跨ぎ判断では、企業IR・TDnetで発表日時を照合してください。")
 
     except Exception as exc:
-        st.error(str(exc))
+        st.error(f"処理中にエラーが発生しました: {exc}")
 
 with st.expander("CSV形式を見る"):
     st.code(
@@ -389,9 +490,9 @@ with st.expander("CSV形式を見る"):
 
 with st.expander("計算定義"):
     st.markdown(
-        "- **決算当日騰落率**：決算発表日の終値 ÷ 前営業日終値 − 1\n"
-        "- **翌日GU率**：翌営業日の始値 ÷ 決算発表日の終値 − 1\n"
-        "- **翌日騰落率**：翌営業日の終値 ÷ 決算発表日の終値 − 1\n"
-        "- **決算前終値→翌日終値**：翌営業日の終値 ÷ 決算発表日前営業日の終値 − 1\n"
-        "- 四半期は決算月から自動推定します。CSV・手入力で指定した値を優先します。"
+        "- **決算当日騰落率**：発表日終値 ÷ 前営業日終値 − 1\n"
+        "- **翌日GU率**：翌営業日始値 ÷ 発表日終値 − 1\n"
+        "- **翌日寄り後騰落率**：翌営業日終値 ÷ 翌営業日始値 − 1\n"
+        "- **翌日終値騰落率**：翌営業日終値 ÷ 発表日終値 − 1\n"
+        "- 四半期は決算月と発表日から推定し、CSV・手入力の指定を優先します。"
     )
