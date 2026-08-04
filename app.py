@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 from datetime import time
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -10,12 +11,19 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="日本株 決算四半期リアクション分析", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="日本株 決算トレーダー分析",
+    page_icon="📊",
+    layout="wide",
+)
 
-VALID_QUARTERS = ["1Q", "2Q", "3Q", "本決算"]
 JQUANTS_URL = "https://api.jquants.com/v2/fins/summary"
+VALID_QUARTERS = ["1Q", "2Q", "3Q", "本決算"]
 
 
+# -----------------------------
+# 共通ユーティリティ
+# -----------------------------
 def normalize_code(raw: str) -> str:
     code = raw.strip().upper().replace(".T", "")
     if not re.fullmatch(r"[0-9A-Z]{4,6}", code):
@@ -81,57 +89,63 @@ def normalize_clock(raw: object) -> str:
     if re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d:[0-5]\d", text):
         return text[:5]
     if re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", text):
-        return text.zfill(5)
+        hour, minute = text.split(":")
+        return f"{int(hour):02d}:{int(minute):02d}"
     return ""
 
 
 def close_time_for(day: pd.Timestamp) -> time:
-    # 東証は2024-11-05から取引終了時刻を15:30へ延長。
-    if day.normalize() >= pd.Timestamp("2024-11-05"):
-        return time(15, 30)
-    return time(15, 0)
+    return time(15, 30) if day.normalize() >= pd.Timestamp("2024-11-05") else time(15, 0)
 
 
-def classify_announcement(day: pd.Timestamp, clock_text: str, is_trading_day: bool) -> tuple[str, str, str]:
-    """発表時刻を取引時間帯に分類する。
-
-    戻り値: (発表区分, 決算跨ぎ適格, 主反応指標)
-    """
+def classify_announcement(day: pd.Timestamp, clock_text: str, is_trading_day: bool) -> tuple[str, str]:
     if not is_trading_day:
-        return "休場日発表", "対象", "次営業日GU・終値"
+        return "休場日発表", "決算跨ぎ対象"
     if not clock_text:
-        return "時刻不明", "判定不能", "翌営業日反応（参考）"
-
+        return "時刻不明", "判定不能"
     hour, minute = map(int, clock_text.split(":"))
     announced = time(hour, minute)
     close_time = close_time_for(day)
-
     if announced < time(9, 0):
-        return "寄り前", "対象外", "当日始値・終値"
+        return "寄り前", "場中分析対象外"
     if announced < time(11, 30):
-        return "前場中", "対象外", "当日終値（参考）"
+        return "前場中", "場中分析対象"
     if announced < time(12, 30):
-        return "昼休み", "対象外", "当日後場・終値"
+        return "昼休み", "場中分析対象"
     if announced < close_time:
-        return "後場中", "対象外", "当日終値（参考）"
-    return "引け後", "対象", "翌営業日GU・終値"
+        return "後場中", "場中分析対象"
+    return "引け後", "決算跨ぎ対象"
 
 
-def time_reliability(source: str, clock_text: str) -> str:
+def reaction_start_timestamp(day: pd.Timestamp, clock_text: str, session: str) -> pd.Timestamp | None:
     if not clock_text:
-        return "×"
-    source_text = str(source)
-    if "J-Quants" in source_text or "TDnet" in source_text:
-        return "◎"
-    if "企業IR" in source_text:
-        return "◎"
-    if source_text in {"CSV", "手入力"}:
-        return "○"
-    return "△"
+        return None
+    day = pd.Timestamp(day).normalize()
+    if session == "昼休み":
+        return day + pd.Timedelta(hours=12, minutes=30)
+    hour, minute = map(int, clock_text.split(":"))
+    return day + pd.Timedelta(hours=hour, minutes=minute)
 
 
+def confidence_label(n: int) -> str:
+    if n >= 8:
+        return "高"
+    if n >= 5:
+        return "中"
+    return "低"
+
+
+def pct(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):+.2f}%"
+
+
+# -----------------------------
+# データ取得
+# -----------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_prices(ticker: str, years: int) -> pd.DataFrame:
+def load_daily_prices(ticker: str, years: int) -> pd.DataFrame:
     today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
     start = today - pd.DateOffset(years=years, months=9)
     end = today + pd.Timedelta(days=3)
@@ -144,7 +158,7 @@ def load_prices(ticker: str, years: int) -> pd.DataFrame:
         threads=False,
     )
     if data.empty:
-        raise RuntimeError("株価データを取得できませんでした。")
+        raise RuntimeError("日足株価を取得できませんでした。")
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
     required = ["Open", "High", "Low", "Close", "Volume"]
@@ -226,78 +240,10 @@ def load_jquants_earnings(code: str, api_key: str) -> tuple[pd.DataFrame, str]:
     return out[columns], status
 
 
-def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
-    columns = ["earnings_date", "quarter", "announcement_time", "source", "doc_type"]
-    if uploaded_file is None:
-        return pd.DataFrame(columns=columns)
-    raw = uploaded_file.getvalue()
-    decoded = None
-    for encoding in ("utf-8-sig", "cp932", "utf-8"):
-        try:
-            decoded = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    if decoded is None:
-        raise ValueError("CSVの文字コードを読み取れません。")
-    frame = pd.read_csv(io.StringIO(decoded))
-    if "earnings_date" not in frame.columns:
-        raise ValueError("CSVには earnings_date 列が必要です。")
-    out = pd.DataFrame()
-    out["earnings_date"] = pd.to_datetime(frame["earnings_date"], errors="coerce").dt.normalize()
-    out["quarter"] = frame["quarter"].astype(str) if "quarter" in frame.columns else ""
-    out["announcement_time"] = (
-        frame["announcement_time"].map(normalize_clock) if "announcement_time" in frame.columns else ""
-    )
-    out["source"] = frame["source"].astype(str) if "source" in frame.columns else "CSV"
-    out["doc_type"] = frame["doc_type"].astype(str) if "doc_type" in frame.columns else ""
-    return out.dropna(subset=["earnings_date"])
-
-
-def parse_manual_dates(text: str) -> pd.DataFrame:
-    rows = []
-    for line in text.splitlines():
-        parts = [x.strip() for x in line.split(",")]
-        if not parts or not parts[0]:
-            continue
-        disclosed = pd.to_datetime(parts[0], errors="coerce")
-        if pd.isna(disclosed):
-            continue
-        rows.append(
-            {
-                "earnings_date": pd.Timestamp(disclosed).normalize(),
-                "quarter": parts[1] if len(parts) > 1 else "",
-                "announcement_time": normalize_clock(parts[2]) if len(parts) > 2 else "",
-                "source": parts[3] if len(parts) > 3 and parts[3] else "手入力",
-                "doc_type": "",
-            }
-        )
-    return pd.DataFrame(rows, columns=["earnings_date", "quarter", "announcement_time", "source", "doc_type"])
-
-
-def combine_events(jquants: pd.DataFrame, uploaded: pd.DataFrame, manual: pd.DataFrame,
-                   cutoff: pd.Timestamp, latest_price_date: pd.Timestamp) -> pd.DataFrame:
-    frames = [x for x in (jquants, uploaded, manual) if not x.empty]
-    if not frames:
-        return pd.DataFrame(columns=["earnings_date", "quarter", "announcement_time", "source", "doc_type"])
-    all_events = pd.concat(frames, ignore_index=True)
-    all_events["earnings_date"] = pd.to_datetime(all_events["earnings_date"], errors="coerce").dt.normalize()
-    all_events = all_events.dropna(subset=["earnings_date"])
-    all_events = all_events[
-        (all_events["earnings_date"] >= cutoff) & (all_events["earnings_date"] <= latest_price_date)
-    ]
-    priority = {"手入力": 50, "CSV": 40, "企業IR": 45, "TDnet": 50, "J-Quants 財務情報": 35}
-    all_events["_priority"] = all_events["source"].map(priority).fillna(30)
-    return (
-        all_events.sort_values(["earnings_date", "quarter", "_priority"])
-        .drop_duplicates(["earnings_date", "quarter"], keep="last")
-        .drop(columns="_priority")
-        .sort_values("earnings_date")
-        .reset_index(drop=True)
-    )
-
-
-def analyze_events(prices: pd.DataFrame, events: pd.DataFrame, flat_threshold: float) -> pd.DataFrame:
+# -----------------------------
+# 日足・決算跨ぎ分析
+# -----------------------------
+def analyze_daily_events(prices: pd.DataFrame, events: pd.DataFrame, flat_threshold: float) -> pd.DataFrame:
     rows: list[dict] = []
     index = prices.index
     for _, event in events.iterrows():
@@ -312,144 +258,327 @@ def analyze_events(prices: pd.DataFrame, events: pd.DataFrame, flat_threshold: f
                 continue
             prev_day = index[pos - 1]
             next_day = index[pos + 1]
-            reference_close_day = event_day
+            ref_day = event_day
         else:
-            # 休場日発表は直前営業日を基準、直後営業日を反応日とする。
             if pos < 1:
                 continue
             prev_day = index[pos - 1]
             next_day = event_day
-            reference_close_day = prev_day
+            ref_day = prev_day
 
         clock = normalize_clock(event.get("announcement_time", ""))
-        session, carry_eligible, primary_metric = classify_announcement(disclosed, clock, is_trading_day)
-        reliability = time_reliability(str(event.get("source", "")), clock)
-
+        session, strategy = classify_announcement(disclosed, clock, is_trading_day)
         prev_close = float(prices.loc[prev_day, "Close"])
         event_open = float(prices.loc[event_day, "Open"])
         event_close = float(prices.loc[event_day, "Close"])
-        ref_close = float(prices.loc[reference_close_day, "Close"])
+        ref_close = float(prices.loc[ref_day, "Close"])
         next_open = float(prices.loc[next_day, "Open"])
         next_close = float(prices.loc[next_day, "Close"])
 
         same_day_change = (event_close / prev_close - 1) * 100 if is_trading_day else np.nan
-        same_day_open_gap = (event_open / prev_close - 1) * 100 if is_trading_day else np.nan
         next_gu = (next_open / ref_close - 1) * 100
         next_close_change = (next_close / ref_close - 1) * 100
         next_intraday = (next_close / next_open - 1) * 100
-
-        if carry_eligible == "対象":
-            judged_value = next_close_change
-            judgment = "上昇" if judged_value > flat_threshold else (
-                "下落" if judged_value < -flat_threshold else "横ばい"
+        if strategy == "決算跨ぎ対象":
+            result = "上昇" if next_close_change > flat_threshold else (
+                "下落" if next_close_change < -flat_threshold else "横ばい"
             )
         else:
-            judgment = "対象外"
+            result = "対象外"
 
         rows.append(
             {
                 "決算発表日": disclosed.date(),
                 "四半期": event["quarter"],
                 "発表時刻": clock or "不明",
-                "時間信頼度": reliability,
                 "発表区分": session,
-                "引け買い決算跨ぎ": carry_eligible,
-                "主反応指標": primary_metric,
+                "分析区分": strategy,
                 "データ源": event["source"],
                 "前営業日": prev_day.date(),
-                "発表日取引日": event_day.date(),
                 "翌営業日": next_day.date(),
-                "当日寄りGU率(%)": same_day_open_gap,
                 "当日終値騰落率(%)": same_day_change,
                 "翌営業日GU率(%)": next_gu,
                 "翌営業日寄り後(%)": next_intraday,
                 "翌営業日終値騰落率(%)": next_close_change,
-                "決算跨ぎ判定": judgment,
+                "決算跨ぎ判定": result,
             }
         )
     return pd.DataFrame(rows)
 
 
-def summarize_all(detail: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for quarter, group in detail.groupby("四半期"):
-        rows.append(
-            {
-                "四半期": quarter,
-                "全件数": len(group),
-                "引け後・休場日件数": int((group["引け買い決算跨ぎ"] == "対象").sum()),
-                "昼休み・場中件数": int(group["発表区分"].isin(["前場中", "昼休み", "後場中"]).sum()),
-                "平均当日終値(%)": group["当日終値騰落率(%)"].mean(),
-                "平均翌営業日GU(%)": group["翌営業日GU率(%)"].mean(),
-                "平均翌営業日終値(%)": group["翌営業日終値騰落率(%)"].mean(),
-            }
-        )
-    result = pd.DataFrame(rows)
-    order = {q: i for i, q in enumerate(VALID_QUARTERS)}
-    result["_order"] = result["四半期"].map(order).fillna(99)
-    return result.sort_values("_order").drop(columns="_order").reset_index(drop=True)
-
-
-def summarize_carry(detail: pd.DataFrame) -> pd.DataFrame:
-    eligible = detail[detail["引け買い決算跨ぎ"] == "対象"].copy()
-    if eligible.empty:
+def summarize_daily(detail: pd.DataFrame, target_strategy: str) -> pd.DataFrame:
+    if detail.empty:
+        return pd.DataFrame()
+    target = detail[detail["分析区分"] == target_strategy].copy()
+    if target.empty:
         return pd.DataFrame()
     rows = []
-    for quarter, group in eligible.groupby("四半期"):
+    for quarter, group in target.groupby("四半期"):
         n = len(group)
-        up = int((group["決算跨ぎ判定"] == "上昇").sum())
         rows.append(
             {
                 "四半期": quarter,
                 "件数": n,
-                "上昇": up,
-                "下落": int((group["決算跨ぎ判定"] == "下落").sum()),
-                "横ばい": int((group["決算跨ぎ判定"] == "横ばい").sum()),
-                "勝率(%)": up / n * 100,
+                "勝率(%)": (group["翌営業日終値騰落率(%)"] > 0).mean() * 100,
                 "GU率(%)": (group["翌営業日GU率(%)"] > 0).mean() * 100,
                 "平均GU(%)": group["翌営業日GU率(%)"].mean(),
                 "平均翌日終値(%)": group["翌営業日終値騰落率(%)"].mean(),
                 "中央値翌日終値(%)": group["翌営業日終値騰落率(%)"].median(),
+                "確信度": confidence_label(n),
             }
         )
-    result = pd.DataFrame(rows)
-    result["参考スコア"] = (
-        result["平均翌日終値(%)"] * 0.45
-        + result["中央値翌日終値(%)"] * 0.20
-        + result["平均GU(%)"] * 0.20
-        + (result["勝率(%)"] - 50) / 10 * 0.10
-        + (result["GU率(%)"] - 50) / 10 * 0.05
-    ) * np.minimum(result["件数"] / 6, 1)
-    result["確信度"] = result["件数"].map(lambda n: "高" if n >= 8 else ("中" if n >= 5 else "低"))
-    result["評価"] = "判定保留"
-    eligible_mask = result["件数"] >= 2
-    ranks = result.loc[eligible_mask, "参考スコア"].rank(method="min", ascending=False)
-    result.loc[eligible_mask, "評価"] = ranks.map(lambda r: "S" if r == 1 else ("A" if r == 2 else ("B" if r == 3 else "C")))
-    order = {q: i for i, q in enumerate(VALID_QUARTERS)}
-    result["_order"] = result["四半期"].map(order).fillna(99)
-    return result.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+    out = pd.DataFrame(rows)
+    out["参考スコア"] = (
+        out["平均翌日終値(%)"] * 0.5
+        + out["中央値翌日終値(%)"] * 0.2
+        + out["平均GU(%)"] * 0.2
+        + (out["勝率(%)"] - 50) / 10 * 0.1
+    ) * np.minimum(out["件数"] / 6, 1)
+    out["評価"] = "判定保留"
+    mask = out["件数"] >= 2
+    ranks = out.loc[mask, "参考スコア"].rank(method="min", ascending=False)
+    out.loc[mask, "評価"] = ranks.map(lambda r: "S" if r == 1 else ("A" if r == 2 else ("B" if r == 3 else "C")))
+    return out.sort_values(["参考スコア", "件数"], ascending=False).reset_index(drop=True)
 
 
-st.title("📊 日本株 決算四半期リアクション分析 — 時刻判定版")
-st.caption("発表時刻に応じて『昼休み・場中』と『引け後』を分離し、引け買い→翌営業日売却の決算跨ぎだけを別集計します。")
+# -----------------------------
+# 場中CSV分析
+# -----------------------------
+def read_csv_flexible(raw: bytes) -> pd.DataFrame:
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "cp932", "utf-8"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=encoding)
+        except Exception as exc:
+            last_error = exc
+    raise ValueError(f"CSVを読み取れませんでした: {last_error}")
+
+
+def find_column(columns: Iterable[str], candidates: Iterable[str]) -> str | None:
+    normalized = {re.sub(r"[^a-z0-9]", "", str(c).lower()): str(c) for c in columns}
+    for candidate in candidates:
+        key = re.sub(r"[^a-z0-9]", "", candidate.lower())
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def parse_intraday_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
+    if uploaded_file is None:
+        return pd.DataFrame(), "CSV未選択"
+    frame = read_csv_flexible(uploaded_file.getvalue())
+    if frame.empty:
+        raise ValueError("場中CSVが空です。")
+
+    dt_col = find_column(frame.columns, ["datetime", "date_time", "timestamp", "日時", "時刻"])
+    date_col = find_column(frame.columns, ["date", "日付"])
+    time_col = find_column(frame.columns, ["time", "時間"])
+    open_col = find_column(frame.columns, ["open", "始値"])
+    high_col = find_column(frame.columns, ["high", "高値"])
+    low_col = find_column(frame.columns, ["low", "安値"])
+    close_col = find_column(frame.columns, ["close", "終値"])
+    volume_col = find_column(frame.columns, ["volume", "出来高"])
+
+    if dt_col:
+        dt = pd.to_datetime(frame[dt_col], errors="coerce")
+    elif date_col and time_col:
+        dt = pd.to_datetime(frame[date_col].astype(str) + " " + frame[time_col].astype(str), errors="coerce")
+    else:
+        raise ValueError("CSVには datetime 列、または date と time 列が必要です。")
+
+    required_map = {"Open": open_col, "High": high_col, "Low": low_col, "Close": close_col}
+    missing = [name for name, col in required_map.items() if col is None]
+    if missing:
+        raise ValueError(f"場中CSVに不足している列: {', '.join(missing)}")
+
+    out = pd.DataFrame(index=dt)
+    for target, source in required_map.items():
+        out[target] = pd.to_numeric(frame[source], errors="coerce").to_numpy()
+    out["Volume"] = pd.to_numeric(frame[volume_col], errors="coerce").to_numpy() if volume_col else np.nan
+    out = out[~out.index.isna()].dropna(subset=["Open", "High", "Low", "Close"])
+    out.index = pd.DatetimeIndex(out.index).tz_localize(None)
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    if out.empty:
+        raise ValueError("有効な場中データがありません。")
+
+    diffs = out.index.to_series().diff().dropna().dt.total_seconds().div(60)
+    interval = int(round(diffs[diffs > 0].median())) if (diffs > 0).any() else 0
+    return out, f"{len(out):,}本・推定{interval}分足"
+
+
+def value_at_or_after(day_bars: pd.DataFrame, target: pd.Timestamp, column: str = "Close") -> float | None:
+    pos = day_bars.index.searchsorted(target, side="left")
+    if pos >= len(day_bars):
+        return None
+    return float(day_bars.iloc[pos][column])
+
+
+def classify_intraday_pattern(move5: float, move30: float, close_move: float) -> str:
+    if pd.isna(move5) or pd.isna(close_move):
+        return "判定不能"
+    if move5 > 0 and close_move > 0:
+        if close_move >= move5 * 0.8:
+            return "素直上昇型"
+        return "上昇失速型"
+    if move5 < 0 and close_move > 0:
+        return "V字回復型"
+    if move5 > 0 and close_move <= 0:
+        return "行って来い型"
+    if move5 < 0 and close_move < 0:
+        return "素直下落型"
+    if not pd.isna(move30) and move30 > 0 and close_move < 0:
+        return "後半失速型"
+    return "横ばい型"
+
+
+def analyze_intraday_events(intraday: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict] = []
+    if intraday.empty or events.empty:
+        return pd.DataFrame()
+
+    intraday_dates = set(intraday.index.normalize())
+    for _, event in events.iterrows():
+        day = pd.Timestamp(event["earnings_date"]).normalize()
+        clock = normalize_clock(event.get("announcement_time", ""))
+        is_trading_day = day in intraday_dates
+        session, strategy = classify_announcement(day, clock, is_trading_day)
+        if strategy != "場中分析対象" or not clock or not is_trading_day:
+            continue
+
+        day_bars = intraday[intraday.index.normalize() == day]
+        if day_bars.empty:
+            continue
+        start = reaction_start_timestamp(day, clock, session)
+        if start is None:
+            continue
+
+        pre = day_bars[day_bars.index < start]
+        post = day_bars[day_bars.index >= start]
+        if pre.empty or post.empty:
+            continue
+
+        ref_price = float(pre.iloc[-1]["Close"])
+        first_open = float(post.iloc[0]["Open"])
+        close_price = float(day_bars.iloc[-1]["Close"])
+        high_after = float(post["High"].max())
+        low_after = float(post["Low"].min())
+
+        horizon_values: dict[int, float | None] = {}
+        for minutes in (5, 15, 30, 60):
+            horizon_values[minutes] = value_at_or_after(day_bars, start + pd.Timedelta(minutes=minutes))
+
+        def move(value: float | None) -> float:
+            return (value / ref_price - 1) * 100 if value is not None else np.nan
+
+        move5 = move(horizon_values[5])
+        move15 = move(horizon_values[15])
+        move30 = move(horizon_values[30])
+        move60 = move(horizon_values[60])
+        close_move = move(close_price)
+        entry_to_close = (close_price / first_open - 1) * 100
+        mfe = (high_after / ref_price - 1) * 100
+        mae = (low_after / ref_price - 1) * 100
+        pattern = classify_intraday_pattern(move5, move30, close_move)
+
+        rows.append(
+            {
+                "決算発表日": day.date(),
+                "四半期": event["quarter"],
+                "発表時刻": clock,
+                "発表区分": session,
+                "基準価格": ref_price,
+                "発表後初値": first_open,
+                "5分後(%)": move5,
+                "15分後(%)": move15,
+                "30分後(%)": move30,
+                "60分後(%)": move60,
+                "引け時点(%)": close_move,
+                "発表後初値→引け(%)": entry_to_close,
+                "最大上昇幅MFE(%)": mfe,
+                "最大下落幅MAE(%)": mae,
+                "反応パターン": pattern,
+                "初動プラス": move5 > 0 if not pd.isna(move5) else False,
+                "引けプラス": close_move > 0 if not pd.isna(close_move) else False,
+                "初動継続": (move5 > 0 and close_move > 0) if not pd.isna(move5) else False,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def summarize_intraday(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if detail.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    quarter_rows = []
+    for quarter, group in detail.groupby("四半期"):
+        n = len(group)
+        quarter_rows.append(
+            {
+                "四半期": quarter,
+                "件数": n,
+                "5分後上昇率(%)": group["初動プラス"].mean() * 100,
+                "引け上昇率(%)": group["引けプラス"].mean() * 100,
+                "初動継続率(%)": group["初動継続"].mean() * 100,
+                "平均5分後(%)": group["5分後(%)"].mean(),
+                "平均30分後(%)": group["30分後(%)"].mean(),
+                "平均引け時点(%)": group["引け時点(%)"].mean(),
+                "平均飛び乗り→引け(%)": group["発表後初値→引け(%)"].mean(),
+                "平均MFE(%)": group["最大上昇幅MFE(%)"].mean(),
+                "平均MAE(%)": group["最大下落幅MAE(%)"].mean(),
+                "確信度": confidence_label(n),
+            }
+        )
+    quarter_summary = pd.DataFrame(quarter_rows)
+    quarter_summary["場中スコア"] = (
+        quarter_summary["平均引け時点(%)"] * 0.40
+        + quarter_summary["平均飛び乗り→引け(%)"] * 0.25
+        + quarter_summary["平均30分後(%)"] * 0.15
+        + (quarter_summary["引け上昇率(%)"] - 50) / 10 * 0.10
+        + (quarter_summary["初動継続率(%)"] - 50) / 10 * 0.10
+    ) * np.minimum(quarter_summary["件数"] / 6, 1)
+    quarter_summary = quarter_summary.sort_values(["場中スコア", "件数"], ascending=False).reset_index(drop=True)
+
+    pattern_summary = (
+        detail["反応パターン"]
+        .value_counts()
+        .rename_axis("反応パターン")
+        .reset_index(name="件数")
+    )
+    pattern_summary["構成比(%)"] = pattern_summary["件数"] / len(detail) * 100
+    return quarter_summary, pattern_summary
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("📊 日本株 決算トレーダー分析")
+st.caption("引け後決算のオーバーナイト分析と、場中決算の発表直後〜引けまでの反応分析を1つに統合します。")
 
 with st.sidebar:
     st.header("分析条件")
-    raw_code = st.text_input("銘柄コード", value="4203", max_chars=8)
-    years = st.slider("分析年数", 2, 10, 2)
+    raw_code = st.text_input("銘柄コード", value="7203", max_chars=8)
+    years = st.slider("決算取得年数", 2, 10, 2)
     flat_threshold = st.number_input("横ばい判定幅（±%）", 0.0, 2.0, 0.2, 0.1)
     st.divider()
-    uploaded = st.file_uploader("補完CSV（任意）", type=["csv"])
-    manual = st.text_area(
-        "手入力（任意）",
-        placeholder="2025-08-04,1Q,11:30,TDnet",
-        help="日付,四半期,時刻,情報源",
+    intraday_file = st.file_uploader(
+        "場中1分足・5分足CSV（任意）",
+        type=["csv"],
+        help="datetime, open, high, low, close, volume の形式を推奨します。",
     )
     run = st.button("分析する", type="primary", use_container_width=True)
 
 st.info(
-    "重要：昼休み・場中発表は、引け時点ですでに決算が公表済みです。したがって『引け前〜引け成り買い→翌日売却』の決算跨ぎ対象には含めません。"
+    "場中決算の5分後・30分後・引け反応には分足データが必要です。J-Quants Freeの財務情報から決算日時を取得し、分足CSVと突合します。"
 )
+
+with st.expander("場中CSVの形式"):
+    st.code(
+        "datetime,open,high,low,close,volume\n"
+        "2025-08-07 13:20:00,2500,2505,2498,2503,120000\n"
+        "2025-08-07 13:25:00,2503,2520,2501,2518,450000",
+        language="csv",
+    )
+    st.caption("日本時間・時刻の古い順に並んだCSVを想定しています。1分足または5分足を利用できます。")
 
 if run:
     try:
@@ -458,107 +587,125 @@ if run:
         api_key = str(st.secrets.get("JQUANTS_API_KEY", "")).strip()
         cutoff = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize() - pd.DateOffset(years=years)
 
-        with st.spinner("決算と株価を集計しています…"):
-            prices = load_prices(ticker, years)
-            jq_events, jq_status = load_jquants_earnings(code, api_key)
-            csv_events = parse_uploaded_csv(uploaded)
-            manual_events = parse_manual_dates(manual)
-            events = combine_events(jq_events, csv_events, manual_events, cutoff, prices.index.max())
-            detail = analyze_events(prices, events, flat_threshold)
-            all_summary = summarize_all(detail) if not detail.empty else pd.DataFrame()
-            carry_summary = summarize_carry(detail) if not detail.empty else pd.DataFrame()
+        with st.spinner("決算日時と株価を集計しています…"):
+            prices = load_daily_prices(ticker, years)
+            events, jq_status = load_jquants_earnings(code, api_key)
+            events = events[
+                (events["earnings_date"] >= cutoff)
+                & (events["earnings_date"] <= prices.index.max())
+            ].copy()
+            daily_detail = analyze_daily_events(prices, events, flat_threshold)
+            carry_summary = summarize_daily(daily_detail, "決算跨ぎ対象")
+            intraday_bars, intraday_status = parse_intraday_csv(intraday_file)
+            intraday_detail = analyze_intraday_events(intraday_bars, events) if not intraday_bars.empty else pd.DataFrame()
+            intraday_summary, pattern_summary = summarize_intraday(intraday_detail)
 
         st.subheader(f"{code}（{ticker}）分析結果")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("採用決算", f"{len(detail)}件")
-        c2.metric("決算跨ぎ対象", f"{int((detail['引け買い決算跨ぎ'] == '対象').sum()) if not detail.empty else 0}件")
-        c3.metric("昼休み・場中", f"{int(detail['発表区分'].isin(['前場中','昼休み','後場中']).sum()) if not detail.empty else 0}件")
-        c4.metric("最新株価日", prices.index.max().strftime("%Y-%m-%d"))
+        c1.metric("採用決算", f"{len(daily_detail)}件")
+        c2.metric("引け後・休場日", f"{int((daily_detail['分析区分'] == '決算跨ぎ対象').sum()) if not daily_detail.empty else 0}件")
+        c3.metric("場中・昼休み", f"{int((daily_detail['分析区分'] == '場中分析対象').sum()) if not daily_detail.empty else 0}件")
+        c4.metric("場中CSV一致", f"{len(intraday_detail)}件")
 
-        with st.expander("取得状況", expanded=False):
+        with st.expander("取得状況"):
             st.write(f"- {jq_status}")
-            st.write("- 発表時刻：J-Quantsの開示時刻を使用")
-            st.write("- 時間信頼度：J-Quants・TDnetは◎、企業IRは◎、手入力・CSVは○")
+            st.write(f"- 日足最新日: {prices.index.max().strftime('%Y-%m-%d')}")
+            st.write(f"- 場中データ: {intraday_status}")
 
-        if detail.empty:
-            st.error("分析可能な決算データがありません。")
-        else:
-            st.markdown("### ① 決算跨ぎ判定")
-            carry_count = int((detail["引け買い決算跨ぎ"] == "対象").sum())
-            if carry_count == 0:
+        tab1, tab2, tab3 = st.tabs(["🔵 場中決算分析", "🟢 引け後決算分析", "📋 全決算明細"])
+
+        with tab1:
+            st.markdown("## 場中決算：発表直後から引けまで")
+            if intraday_file is None:
+                st.warning("場中分析には1分足または5分足CSVを選択してください。決算日時は自動取得済みです。")
+            elif intraday_detail.empty:
                 st.warning(
-                    "この取得期間では、引け後または休場日発表の決算がありません。"
-                    "引け買いによる『決算発表前の持ち越し』分析は対象外です。"
+                    "CSVと決算発表日が一致しませんでした。CSVに対象日の分足が含まれるか、日時列が日本時間か確認してください。"
                 )
-            elif carry_summary.empty:
-                st.warning("決算跨ぎ対象はありますが、集計できる件数が不足しています。")
             else:
-                ranked = carry_summary.sort_values(["参考スコア", "件数"], ascending=False)
-                best = ranked.iloc[0]
+                top = intraday_summary.iloc[0]
+                st.success(
+                    f"場中反応最上位：{top['四半期']}｜件数 {int(top['件数'])}｜"
+                    f"5分後上昇率 {top['5分後上昇率(%)']:.1f}%｜"
+                    f"引け上昇率 {top['引け上昇率(%)']:.1f}%｜"
+                    f"平均引け {top['平均引け時点(%)']:+.2f}%｜確信度 {top['確信度']}"
+                )
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("発表5分後 上昇率", f"{intraday_detail['初動プラス'].mean()*100:.1f}%")
+                m2.metric("引けまで上昇率", f"{intraday_detail['引けプラス'].mean()*100:.1f}%")
+                m3.metric("初動継続率", f"{intraday_detail['初動継続'].mean()*100:.1f}%")
+                m4.metric("飛び乗り→引け平均", pct(intraday_detail['発表後初値→引け(%)'].mean()))
+
+                st.markdown("### 四半期別の場中反応")
+                display = intraday_summary.copy()
+                num = display.select_dtypes(include=[np.number]).columns
+                display[num] = display[num].round(2)
+                st.dataframe(display, use_container_width=True, hide_index=True)
+
+                st.markdown("### 反応パターン")
+                pdisplay = pattern_summary.copy()
+                pdisplay["構成比(%)"] = pdisplay["構成比(%)"].round(1)
+                st.dataframe(pdisplay, use_container_width=True, hide_index=True)
+                st.bar_chart(pdisplay.set_index("反応パターン")["件数"])
+
+                st.markdown("### 決算ごとの場中明細")
+                ddisplay = intraday_detail.sort_values("決算発表日", ascending=False).copy()
+                num = ddisplay.select_dtypes(include=[np.number]).columns
+                ddisplay[num] = ddisplay[num].round(2)
+                st.dataframe(ddisplay, use_container_width=True, hide_index=True)
+
+                st.download_button(
+                    "場中分析CSVをダウンロード",
+                    intraday_detail.to_csv(index=False).encode("utf-8-sig"),
+                    f"{code}_intraday_earnings.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
+
+        with tab2:
+            st.markdown("## 引け後決算：翌営業日のGU・終値")
+            if carry_summary.empty:
+                st.warning("取得期間内に引け後・休場日発表がないか、件数が不足しています。")
+            else:
+                best = carry_summary.iloc[0]
                 st.success(
                     f"決算跨ぎ最上位：{best['四半期']}｜評価 {best['評価']}｜"
                     f"勝率 {best['勝率(%)']:.1f}%｜GU率 {best['GU率(%)']:.1f}%｜"
                     f"平均翌日終値 {best['平均翌日終値(%)']:+.2f}%｜確信度 {best['確信度']}"
                 )
-                display_carry = carry_summary.copy()
-                numeric = display_carry.select_dtypes(include=[np.number]).columns
-                display_carry[numeric] = display_carry[numeric].round(2)
-                st.dataframe(display_carry, use_container_width=True, hide_index=True)
+                display = carry_summary.copy()
+                num = display.select_dtypes(include=[np.number]).columns
+                display[num] = display[num].round(2)
+                st.dataframe(display, use_container_width=True, hide_index=True)
 
-            st.markdown("### ② 全決算の参考反応")
-            st.caption("昼休み・場中発表を含みます。翌営業日反応は『決算発表前からの持ち越し』ではありません。")
-            display_all = all_summary.copy()
-            numeric = display_all.select_dtypes(include=[np.number]).columns
-            display_all[numeric] = display_all[numeric].round(2)
-            st.dataframe(display_all, use_container_width=True, hide_index=True)
-
-            st.markdown("### ③ 決算明細")
-            display_detail = detail.sort_values("決算発表日", ascending=False).copy()
-            percent_columns = [c for c in display_detail.columns if "(%)" in c]
-            display_detail[percent_columns] = display_detail[percent_columns].round(2)
-            st.dataframe(display_detail, use_container_width=True, hide_index=True)
-
-            st.markdown("### ④ 発表時刻チェック")
-            time_table = (
-                detail.groupby(["発表時刻", "時間信頼度", "発表区分", "引け買い決算跨ぎ"])
-                .size()
-                .reset_index(name="件数")
-                .sort_values("件数", ascending=False)
-            )
-            st.dataframe(time_table, use_container_width=True, hide_index=True)
-
-            col1, col2, col3 = st.columns(3)
-            col1.download_button(
-                "明細CSV",
-                detail.to_csv(index=False).encode("utf-8-sig"),
-                f"{code}_earnings_detail.csv",
-                "text/csv",
-                use_container_width=True,
-            )
-            col2.download_button(
-                "全決算集計CSV",
-                all_summary.to_csv(index=False).encode("utf-8-sig"),
-                f"{code}_all_summary.csv",
-                "text/csv",
-                use_container_width=True,
-            )
-            col3.download_button(
-                "決算跨ぎ集計CSV",
-                carry_summary.to_csv(index=False).encode("utf-8-sig"),
-                f"{code}_carry_summary.csv",
-                "text/csv",
-                use_container_width=True,
-                disabled=carry_summary.empty,
-            )
+        with tab3:
+            st.markdown("## 決算日時・日足反応一覧")
+            if daily_detail.empty:
+                st.error("分析可能な決算データがありません。")
+            else:
+                display = daily_detail.sort_values("決算発表日", ascending=False).copy()
+                num = display.select_dtypes(include=[np.number]).columns
+                display[num] = display[num].round(2)
+                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "全決算明細CSVをダウンロード",
+                    daily_detail.to_csv(index=False).encode("utf-8-sig"),
+                    f"{code}_earnings_all.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
 
     except Exception as exc:
         st.error(f"処理中にエラーが発生しました: {exc}")
 
-with st.expander("判定ルール"):
+with st.expander("場中パターンの定義"):
     st.markdown(
-        "- **寄り前・前場中・昼休み・後場中**：引け買い決算跨ぎの対象外\n"
-        "- **引け後・休場日発表**：引け買い決算跨ぎの対象\n"
-        "- 東証の引けは2024年11月5日以降15:30、それ以前は15:00として判定\n"
-        "- 11:30発表は昼休み発表として扱い、当日後場に決算反応が出る可能性があります\n"
-        "- 発表時刻不明は決算跨ぎの対象可否を判定しません"
+        "- **素直上昇型**：発表5分後がプラスで、引けもプラスを維持\n"
+        "- **上昇失速型**：初動は上昇したが、引けにかけて上昇幅を大きく縮小\n"
+        "- **V字回復型**：発表5分後はマイナスだが、引けはプラス\n"
+        "- **行って来い型**：発表5分後はプラスだが、引けはゼロ以下\n"
+        "- **素直下落型**：発表5分後も引けもマイナス\n"
+        "- **MFE**：発表前基準価格から引けまでの最大上昇幅\n"
+        "- **MAE**：発表前基準価格から引けまでの最大下落幅"
     )
