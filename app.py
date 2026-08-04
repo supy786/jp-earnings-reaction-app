@@ -559,26 +559,47 @@ with st.sidebar:
     raw_code = st.text_input("銘柄コード", value="7203", max_chars=8)
     years = st.slider("決算取得年数", 2, 10, 2)
     flat_threshold = st.number_input("横ばい判定幅（±%）", 0.0, 2.0, 0.2, 0.1)
-    st.divider()
-    intraday_file = st.file_uploader(
-        "場中1分足・5分足CSV（任意）",
-        type=["csv"],
-        help="datetime, open, high, low, close, volume の形式を推奨します。",
-    )
-    run = st.button("分析する", type="primary", use_container_width=True)
 
+st.markdown("## ① 分足CSVを選択（場中分析をする場合）")
 st.info(
-    "場中決算の5分後・30分後・引け反応には分足データが必要です。J-Quants Freeの財務情報から決算日時を取得し、分足CSVと突合します。"
+    "引け後決算の分析だけならCSVなしでも使えます。場中決算の5分後・30分後・引け反応を調べる場合は、1分足または5分足CSVを選択してください。"
 )
 
-with st.expander("場中CSVの形式"):
-    st.code(
+left_upload, right_help = st.columns([2, 1])
+with left_upload:
+    intraday_file = st.file_uploader(
+        "📁 1分足・5分足CSVをここで選択",
+        type=["csv"],
+        help="datetime, open, high, low, close, volume の形式を推奨します。",
+        key="intraday_csv_main",
+    )
+    if intraday_file is not None:
+        st.success(f"CSVを選択しました：{intraday_file.name}")
+    else:
+        st.caption("未選択：引け後分析のみ実行できます。")
+
+with right_help:
+    sample_csv = (
         "datetime,open,high,low,close,volume\n"
         "2025-08-07 13:20:00,2500,2505,2498,2503,120000\n"
-        "2025-08-07 13:25:00,2503,2520,2501,2518,450000",
-        language="csv",
+        "2025-08-07 13:25:00,2503,2520,2501,2518,450000\n"
     )
-    st.caption("日本時間・時刻の古い順に並んだCSVを想定しています。1分足または5分足を利用できます。")
+    st.download_button(
+        "⬇️ CSVテンプレート",
+        data=sample_csv.encode("utf-8-sig"),
+        file_name="sample_intraday.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    with st.expander("対応する列名"):
+        st.markdown(
+            "- 英語：`datetime, open, high, low, close, volume`\n"
+            "- 日本語：`日時, 始値, 高値, 安値, 終値, 出来高`\n"
+            "- 日本時間・時刻の古い順を推奨"
+        )
+
+st.markdown("## ② 分析を開始")
+run = st.button("分析する", type="primary", use_container_width=True)
 
 if run:
     try:
