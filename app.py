@@ -108,9 +108,16 @@ def _normalize_jq_quarter(value: str) -> str:
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_jquants_earnings(code: str, api_key: str) -> tuple[pd.DataFrame, str]:
+    """J-Quants財務サマリーから「実際の四半期決算」だけを取得する。
+
+    業績予想修正・配当予想修正・その他期間・同日重複を除外する。
+    DocTypeを最優先に四半期を判定し、同日同四半期に複数資料がある場合は
+    連結資料を優先して1件へ統合する。
+    """
     cols = ["earnings_date", "quarter", "announcement_time", "source"]
     if not api_key:
         return pd.DataFrame(columns=cols), "J-Quants: APIキー未設定"
+
     jq_code = code if len(code) == 5 else f"{code}0"
     url = "https://api.jquants.com/v2/fins/summary"
     try:
@@ -125,29 +132,91 @@ def load_jquants_earnings(code: str, api_key: str) -> tuple[pd.DataFrame, str]:
     except Exception as exc:
         return pd.DataFrame(columns=cols), f"J-Quants取得失敗: {type(exc).__name__}"
 
-    rows = []
+    def quarter_from_doc_type(doc_type: str) -> str:
+        t = str(doc_type).strip()
+        if t.startswith("1QFinancialStatements_"):
+            return "1Q"
+        if t.startswith("2QFinancialStatements_"):
+            return "2Q"
+        if t.startswith("3QFinancialStatements_"):
+            return "3Q"
+        if t.startswith("FYFinancialStatements_"):
+            return "本決算"
+        return ""
+
+    def document_priority(doc_type: str) -> int:
+        t = str(doc_type)
+        score = 0
+        if "Consolidated" in t and "NonConsolidated" not in t:
+            score += 20
+        if "IFRS" in t or "JP" in t or "JMIS" in t:
+            score += 5
+        return score
+
+    raw_rows = []
+    doc_type_counts: dict[str, int] = {}
+    excluded = 0
     for rec in records:
         if not isinstance(rec, dict):
             continue
-        dt = pd.to_datetime(_pick(rec, "DiscDate", "DisclosedDate", "disclosed_date", "Date"), errors="coerce")
-        quarter = _normalize_jq_quarter(_pick(rec, "CurPerType", "CurrentPeriodType", "TypeOfCurrentPeriod", "period_type"))
-        if pd.isna(dt) or not quarter:
+        doc_type = str(_pick(rec, "DocType", "TypeOfDocument", "document_type")).strip()
+        doc_type_counts[doc_type or "(空欄)"] = doc_type_counts.get(doc_type or "(空欄)", 0) + 1
+
+        # 決算短信に対応する4種類だけを採用。修正開示やその他期間は除外。
+        quarter = quarter_from_doc_type(doc_type)
+        if not quarter:
+            excluded += 1
             continue
+
+        dt = pd.to_datetime(
+            _pick(rec, "DiscDate", "DisclosedDate", "disclosed_date", "Date"),
+            errors="coerce",
+        )
+        if pd.isna(dt):
+            excluded += 1
+            continue
+
         tm = str(_pick(rec, "DiscTime", "DisclosedTime", "disclosed_time")).strip()
         if not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", tm):
             tm = ""
         elif len(tm) == 8:
             tm = tm[:5]
-        rows.append({
+
+        raw_rows.append({
             "earnings_date": pd.Timestamp(dt).normalize(),
             "quarter": quarter,
             "announcement_time": tm,
             "source": "J-Quants 財務情報",
+            "_doc_type": doc_type,
+            "_priority": document_priority(doc_type),
         })
-    if not rows:
-        return pd.DataFrame(columns=cols), f"J-Quants: 0件（応答{len(records)}件）"
-    out = pd.DataFrame(rows, columns=cols).drop_duplicates(["earnings_date", "quarter"]).sort_values("earnings_date")
-    return out.reset_index(drop=True), f"J-Quants: {len(out)}件"
+
+    if not raw_rows:
+        type_summary = ", ".join(f"{k}:{v}" for k, v in sorted(doc_type_counts.items())[:6])
+        suffix = f" / 種別 {type_summary}" if type_summary else ""
+        return pd.DataFrame(columns=cols), f"J-Quants: 0件（応答{len(records)}件・除外{excluded}件{suffix}）"
+
+    raw = pd.DataFrame(raw_rows)
+    before = len(raw)
+    # 同日・同四半期の連結／単体や訂正由来の重複を1件へ統合。
+    out = (
+        raw.sort_values(
+            ["earnings_date", "quarter", "_priority", "announcement_time"],
+            ascending=[True, True, False, True],
+        )
+        .drop_duplicates(["earnings_date", "quarter"], keep="first")
+        .sort_values("earnings_date")
+        .reset_index(drop=True)
+    )
+    duplicate_count = before - len(out)
+    out = out[cols]
+    q_counts = out["quarter"].value_counts().reindex(["1Q", "2Q", "3Q", "本決算"], fill_value=0)
+    q_text = " / ".join(f"{q}:{int(n)}件" for q, n in q_counts.items())
+    status = (
+        f"J-Quants: 採用{len(out)}件（API応答{len(records)}件 / "
+        f"対象外除外{excluded}件 / 重複統合{duplicate_count}件）｜{q_text}"
+    )
+    return out, status
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -531,10 +600,13 @@ def score_quarters(summary: pd.DataFrame) -> pd.DataFrame:
     ) * reliability
     out["参考スコア"] = raw.round(2)
 
-    eligible = out["四半期"].isin(VALID_QUARTERS)
+    # 1件だけでS判定しない。2件未満は判定保留とする。
+    eligible = out["四半期"].isin(VALID_QUARTERS) & (out["件数"] >= 2)
     ranks = out.loc[eligible, "参考スコア"].rank(method="min", ascending=False)
-    out["決算跨ぎ評価"] = "—"
-    out.loc[eligible, "決算跨ぎ評価"] = ranks.map(lambda r: "S" if r == 1 else ("A" if r == 2 else ("B" if r == 3 else "C")))
+    out["決算跨ぎ評価"] = "判定保留"
+    out.loc[eligible, "決算跨ぎ評価"] = ranks.map(
+        lambda r: "S" if r == 1 else ("A" if r == 2 else ("B" if r == 3 else "C"))
+    )
     out["確信度"] = out["件数"].map(lambda n: "高" if n >= 8 else ("中" if n >= 5 else "低"))
     return out
 
@@ -546,8 +618,8 @@ def source_counts(events: pd.DataFrame) -> str:
     return " / ".join(f"{name}: {count}件" for name, count in counts.items())
 
 
-st.title("📊 日本株 決算当日・翌営業日リアクション分析")
-st.caption("J-Quantsの財務情報と日足を突合し、1Q・2Q・3Q・本決算ごとの短期反応を集計します。")
+st.title("📊 日本株 決算当日・翌営業日リアクション分析 改良版")
+st.caption("J-Quantsの決算短信だけを抽出し、修正開示・配当修正・同日重複を除外して短期反応を集計します。")
 
 with st.sidebar:
     st.header("分析条件")
@@ -656,6 +728,7 @@ if run:
             st.markdown("### データ品質")
             st.write(f"- 発表時刻不明：{int((detail['発表時刻'] == '不明').sum())}件")
             st.write(f"- 四半期判定不明：{int((detail['四半期'] == '不明').sum())}件")
+            st.write("- 1件だけの四半期は決算跨ぎ評価を『判定保留』にします。")
             st.write("- 最終的な決算跨ぎ判断では、企業IR・TDnetで発表日時を照合してください。")
 
     except Exception as exc:
