@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import time as time_module
 from datetime import time
 from typing import Iterable
 
@@ -142,6 +143,32 @@ def pct(value: float | int | None) -> str:
     return f"{float(value):+.2f}%"
 
 
+def sample_judgement(n: int) -> tuple[str, str]:
+    """サンプル数に応じた表示用の判定と注意文。"""
+    if n >= 8:
+        return "実用参考", "サンプル8件以上"
+    if n >= 5:
+        return "参考", "サンプル5〜7件"
+    if n >= 3:
+        return "暫定", "サンプル3〜4件"
+    return "判定保留", "サンプル2件以下"
+
+
+def api_error_category(status_code: int | None, message: str = "") -> str:
+    text = str(message).lower()
+    if status_code == 401:
+        return "APIキー認証エラー"
+    if status_code == 403:
+        return "契約権限不足または権限反映待ち"
+    if status_code == 429:
+        return "APIレート制限"
+    if status_code and status_code >= 500:
+        return "J-Quants側の一時障害"
+    if "timeout" in text:
+        return "通信タイムアウト"
+    return "通信・応答エラー"
+
+
 # -----------------------------
 # データ取得
 # -----------------------------
@@ -268,31 +295,45 @@ def load_jquants_minute_bars(
         while True:
             if pagination_key:
                 params["pagination_key"] = pagination_key
-            try:
-                response = requests.get(
-                    JQUANTS_MINUTE_URL,
-                    params=params,
-                    headers=headers,
-                    timeout=30,
-                )
-            except Exception as exc:
-                failed_dates.append(f"{date_text}:{type(exc).__name__}")
+            response = None
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    response = requests.get(
+                        JQUANTS_MINUTE_URL,
+                        params=params,
+                        headers=headers,
+                        timeout=30,
+                    )
+                    if response.status_code == 429 or response.status_code >= 500:
+                        if attempt < 2:
+                            time_module.sleep(1.5 * (2 ** attempt))
+                            continue
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < 2:
+                        time_module.sleep(1.5 * (2 ** attempt))
+                        continue
+
+            if response is None:
+                category = api_error_category(None, str(last_exc or ""))
+                failed_dates.append(f"{date_text}:{category}")
                 break
 
             if response.status_code in (401, 403):
-                message = (
-                    "分足アドオン未契約または権限不足"
-                    f"（HTTP {response.status_code}）。CSV補完を利用できます。"
-                )
+                category = api_error_category(response.status_code)
+                message = f"{category}（HTTP {response.status_code}）。契約直後は数分待って再分析してください。"
                 return pd.DataFrame(columns=columns), message, False
             if response.status_code == 429:
-                failed_dates.append(f"{date_text}:レート制限")
+                failed_dates.append(f"{date_text}:{api_error_category(429)}")
                 break
             try:
                 response.raise_for_status()
                 payload = response.json()
             except Exception as exc:
-                failed_dates.append(f"{date_text}:{type(exc).__name__}")
+                category = api_error_category(response.status_code, str(exc))
+                failed_dates.append(f"{date_text}:{category}")
                 break
 
             records = _extract_records(payload)
@@ -547,6 +588,7 @@ def analyze_intraday_events(intraday: pd.DataFrame, events: pd.DataFrame) -> pd.
         return pd.DataFrame()
 
     intraday_dates = set(intraday.index.normalize())
+    entry_minutes = (0, 5, 10, 15, 30, 60)
     for _, event in events.iterrows():
         day = pd.Timestamp(event["earnings_date"]).normalize()
         clock = normalize_clock(event.get("announcement_time", ""))
@@ -568,52 +610,104 @@ def analyze_intraday_events(intraday: pd.DataFrame, events: pd.DataFrame) -> pd.
             continue
 
         ref_price = float(pre.iloc[-1]["Close"])
-        first_open = float(post.iloc[0]["Open"])
         close_price = float(day_bars.iloc[-1]["Close"])
         high_after = float(post["High"].max())
         low_after = float(post["Low"].min())
 
         horizon_values: dict[int, float | None] = {}
-        for minutes in (5, 15, 30, 60):
+        for minutes in (5, 10, 15, 30, 60):
             horizon_values[minutes] = value_at_or_after(day_bars, start + pd.Timedelta(minutes=minutes))
 
-        def move(value: float | None) -> float:
+        def move_from_ref(value: float | None) -> float:
             return (value / ref_price - 1) * 100 if value is not None else np.nan
 
-        move5 = move(horizon_values[5])
-        move15 = move(horizon_values[15])
-        move30 = move(horizon_values[30])
-        move60 = move(horizon_values[60])
-        close_move = move(close_price)
-        entry_to_close = (close_price / first_open - 1) * 100
-        mfe = (high_after / ref_price - 1) * 100
-        mae = (low_after / ref_price - 1) * 100
-        pattern = classify_intraday_pattern(move5, move30, close_move)
+        row = {
+            "決算発表日": day.date(),
+            "四半期": event["quarter"],
+            "発表時刻": clock,
+            "発表区分": session,
+            "基準価格": ref_price,
+            "5分後(%)": move_from_ref(horizon_values[5]),
+            "10分後(%)": move_from_ref(horizon_values[10]),
+            "15分後(%)": move_from_ref(horizon_values[15]),
+            "30分後(%)": move_from_ref(horizon_values[30]),
+            "60分後(%)": move_from_ref(horizon_values[60]),
+            "引け時点(%)": move_from_ref(close_price),
+            "最大上昇幅MFE(%)": (high_after / ref_price - 1) * 100,
+            "最大下落幅MAE(%)": (low_after / ref_price - 1) * 100,
+        }
 
-        rows.append(
-            {
-                "決算発表日": day.date(),
-                "四半期": event["quarter"],
-                "発表時刻": clock,
-                "発表区分": session,
-                "基準価格": ref_price,
-                "発表後初値": first_open,
-                "5分後(%)": move5,
-                "15分後(%)": move15,
-                "30分後(%)": move30,
-                "60分後(%)": move60,
-                "引け時点(%)": close_move,
-                "発表後初値→引け(%)": entry_to_close,
-                "最大上昇幅MFE(%)": mfe,
-                "最大下落幅MAE(%)": mae,
-                "反応パターン": pattern,
-                "初動プラス": move5 > 0 if not pd.isna(move5) else False,
-                "引けプラス": close_move > 0 if not pd.isna(close_move) else False,
-                "初動継続": (move5 > 0 and close_move > 0) if not pd.isna(move5) else False,
-            }
-        )
+        for minutes in entry_minutes:
+            target = start + pd.Timedelta(minutes=minutes)
+            pos = post.index.searchsorted(target, side="left")
+            if pos >= len(post):
+                entry_price = np.nan
+                entry_time = "—"
+                to_close = np.nan
+                entry_mfe = np.nan
+                entry_mae = np.nan
+            else:
+                entry_bar = post.iloc[pos]
+                entry_ts = post.index[pos]
+                entry_price = float(entry_bar["Open"])
+                entry_time = entry_ts.strftime("%H:%M")
+                remaining = post.loc[entry_ts:]
+                to_close = (close_price / entry_price - 1) * 100
+                entry_mfe = (float(remaining["High"].max()) / entry_price - 1) * 100
+                entry_mae = (float(remaining["Low"].min()) / entry_price - 1) * 100
+            label = "直後" if minutes == 0 else f"{minutes}分後"
+            row[f"{label}エントリー時刻"] = entry_time
+            row[f"{label}→引け(%)"] = to_close
+            row[f"{label}後MFE(%)"] = entry_mfe
+            row[f"{label}後MAE(%)"] = entry_mae
+
+        move5 = row["5分後(%)"]
+        move30 = row["30分後(%)"]
+        close_move = row["引け時点(%)"]
+        row["反応パターン"] = classify_intraday_pattern(move5, move30, close_move)
+        row["初動プラス"] = bool(move5 > 0) if not pd.isna(move5) else False
+        row["引けプラス"] = bool(close_move > 0) if not pd.isna(close_move) else False
+        row["初動継続"] = bool(move5 > 0 and close_move > 0) if not pd.isna(move5) else False
+        rows.append(row)
     return pd.DataFrame(rows)
 
+
+def summarize_entry_timings(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail.empty:
+        return pd.DataFrame()
+    rows = []
+    for label in ("直後", "5分後", "10分後", "15分後", "30分後", "60分後"):
+        ret_col = f"{label}→引け(%)"
+        mfe_col = f"{label}後MFE(%)"
+        mae_col = f"{label}後MAE(%)"
+        if ret_col not in detail.columns:
+            continue
+        valid = detail.dropna(subset=[ret_col]).copy()
+        if valid.empty:
+            continue
+        n = len(valid)
+        judgement, note = sample_judgement(n)
+        mean_ret = valid[ret_col].mean()
+        median_ret = valid[ret_col].median()
+        win_rate = (valid[ret_col] > 0).mean() * 100
+        mean_mae = valid[mae_col].mean() if mae_col in valid else np.nan
+        mean_mfe = valid[mfe_col].mean() if mfe_col in valid else np.nan
+        risk_adjusted = mean_ret - 0.35 * abs(mean_mae if not pd.isna(mean_mae) else 0)
+        score = (mean_ret * 0.45 + median_ret * 0.25 + (win_rate - 50) / 10 * 0.15 + risk_adjusted * 0.15) * min(n / 8, 1)
+        rows.append({
+            "エントリー": label,
+            "件数": n,
+            "勝率(%)": win_rate,
+            "平均→引け(%)": mean_ret,
+            "中央値→引け(%)": median_ret,
+            "平均MFE(%)": mean_mfe,
+            "平均MAE(%)": mean_mae,
+            "リスク調整値": risk_adjusted,
+            "参考スコア": score,
+            "判定": judgement,
+            "サンプル注記": note,
+        })
+    return pd.DataFrame(rows).sort_values(["参考スコア", "件数"], ascending=False).reset_index(drop=True)
 
 def summarize_intraday(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if detail.empty:
@@ -661,8 +755,8 @@ def summarize_intraday(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 日本株 決算トレーダー分析")
-st.caption("銘柄コードだけで決算日時・日足反応を自動分析。分足アドオンが使える場合は場中反応も自動取得し、未契約時はCSVで補完できます。")
+st.title("📊 日本株 決算トレーダー分析 Pro")
+st.caption("銘柄コードだけで決算日時・日足・分足を自動分析。発表直後〜60分後の各エントリーから引けまでの期待値を比較します。")
 
 with st.sidebar:
     st.header("分析条件")
@@ -699,6 +793,7 @@ if run:
             )
             auto_intraday_detail = analyze_intraday_events(auto_bars, events) if not auto_bars.empty else pd.DataFrame()
             auto_intraday_summary, auto_pattern_summary = summarize_intraday(auto_intraday_detail)
+            auto_entry_summary = summarize_entry_timings(auto_intraday_detail)
 
         st.session_state["analysis_bundle"] = {
             "code": code,
@@ -715,6 +810,7 @@ if run:
             "auto_intraday_detail": auto_intraday_detail,
             "auto_intraday_summary": auto_intraday_summary,
             "auto_pattern_summary": auto_pattern_summary,
+            "auto_entry_summary": auto_entry_summary,
         }
     except Exception as exc:
         st.error(f"処理中にエラーが発生しました: {exc}")
@@ -728,9 +824,11 @@ if bundle:
     daily_detail = bundle["daily_detail"]
     carry_summary = bundle["carry_summary"]
     candidate_dates = bundle["candidate_dates"]
+    auto_bars = bundle["auto_bars"]
     auto_intraday_detail = bundle["auto_intraday_detail"]
     auto_intraday_summary = bundle["auto_intraday_summary"]
     auto_pattern_summary = bundle["auto_pattern_summary"]
+    auto_entry_summary = bundle.get("auto_entry_summary", pd.DataFrame())
     addon_available = bundle["addon_available"]
 
     st.subheader(f"{code}（{ticker}）分析結果")
@@ -745,10 +843,15 @@ if bundle:
         st.write(f"- 日足最新日: {prices.index.max().strftime('%Y-%m-%d')}")
         st.write(f"- 場中候補日: {len(candidate_dates)}日")
         st.write(f"- {bundle['minute_status']}")
+        if "403" in bundle["minute_status"] or "権限" in bundle["minute_status"]:
+            st.info("契約直後は権限反映に時間がかかる場合があります。数分後に再度『分析する』を押してください。")
+        elif not auto_bars.empty:
+            st.success("分足API：利用可能")
 
     csv_intraday_detail = pd.DataFrame()
     csv_intraday_summary = pd.DataFrame()
     csv_pattern_summary = pd.DataFrame()
+    csv_entry_summary = pd.DataFrame()
     csv_status = "CSV未選択"
 
     if auto_intraday_detail.empty:
@@ -780,6 +883,7 @@ if bundle:
                     csv_bars, csv_status = parse_intraday_csv(uploaded)
                     csv_intraday_detail = analyze_intraday_events(csv_bars, events)
                     csv_intraday_summary, csv_pattern_summary = summarize_intraday(csv_intraday_detail)
+                    csv_entry_summary = summarize_entry_timings(csv_intraday_detail)
                     st.success(f"{uploaded.name} を読み込みました：{csv_status} / 決算一致 {len(csv_intraday_detail)}件")
                 except Exception as exc:
                     st.error(f"CSV解析エラー: {exc}")
@@ -787,6 +891,7 @@ if bundle:
     intraday_detail = auto_intraday_detail if not auto_intraday_detail.empty else csv_intraday_detail
     intraday_summary = auto_intraday_summary if not auto_intraday_detail.empty else csv_intraday_summary
     pattern_summary = auto_pattern_summary if not auto_intraday_detail.empty else csv_pattern_summary
+    entry_summary = auto_entry_summary if not auto_intraday_detail.empty else csv_entry_summary
     intraday_source = "J-Quants分足API（自動）" if not auto_intraday_detail.empty else ("CSV補完" if not csv_intraday_detail.empty else "未取得")
 
     tab1, tab2, tab3 = st.tabs(["🔵 場中決算分析", "🟢 引け後決算分析", "📋 全決算明細"])
@@ -808,7 +913,29 @@ if bundle:
             m1.metric("発表5分後 上昇率", f"{intraday_detail['初動プラス'].mean()*100:.1f}%")
             m2.metric("引けまで上昇率", f"{intraday_detail['引けプラス'].mean()*100:.1f}%")
             m3.metric("初動継続率", f"{intraday_detail['初動継続'].mean()*100:.1f}%")
-            m4.metric("飛び乗り→引け平均", pct(intraday_detail['発表後初値→引け(%)'].mean()))
+            m4.metric("直後→引け平均", pct(intraday_detail['直後→引け(%)'].mean()))
+
+            st.markdown("### 最適エントリー時間（発表後→引け）")
+            if entry_summary.empty:
+                st.info("エントリー時間別の比較データがありません。")
+            else:
+                best_entry = entry_summary.iloc[0]
+                if int(best_entry["件数"]) < 3:
+                    st.warning(
+                        f"参考1位：{best_entry['エントリー']}｜平均 {best_entry['平均→引け(%)']:+.2f}%｜"
+                        f"勝率 {best_entry['勝率(%)']:.1f}%｜件数 {int(best_entry['件数'])}｜判定保留"
+                    )
+                else:
+                    st.success(
+                        f"参考1位：{best_entry['エントリー']}｜平均 {best_entry['平均→引け(%)']:+.2f}%｜"
+                        f"勝率 {best_entry['勝率(%)']:.1f}%｜平均MAE {best_entry['平均MAE(%)']:+.2f}%｜"
+                        f"件数 {int(best_entry['件数'])}｜{best_entry['判定']}"
+                    )
+                edisplay = entry_summary.copy()
+                enum = edisplay.select_dtypes(include=[np.number]).columns
+                edisplay[enum] = edisplay[enum].round(2)
+                st.dataframe(edisplay, use_container_width=True, hide_index=True)
+                st.caption("平均MAEはエントリー後の平均最大逆行幅です。損切り-2%の運用では特に確認してください。")
 
             st.markdown("### 四半期別の場中反応")
             display = intraday_summary.copy()
@@ -821,6 +948,15 @@ if bundle:
             pdisplay["構成比(%)"] = pdisplay["構成比(%)"].round(1)
             st.dataframe(pdisplay, use_container_width=True, hide_index=True)
             st.bar_chart(pdisplay.set_index("反応パターン")["件数"])
+
+            if not entry_summary.empty:
+                st.download_button(
+                    "エントリー時間ランキングCSVをダウンロード",
+                    entry_summary.to_csv(index=False).encode("utf-8-sig"),
+                    f"{code}_entry_timing_ranking.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
 
             st.markdown("### 決算ごとの場中明細")
             ddisplay = intraday_detail.sort_values("決算発表日", ascending=False).copy()
