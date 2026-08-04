@@ -726,7 +726,7 @@ def summarize_intraday(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
                 "平均5分後(%)": group["5分後(%)"].mean(),
                 "平均30分後(%)": group["30分後(%)"].mean(),
                 "平均引け時点(%)": group["引け時点(%)"].mean(),
-                "平均飛び乗り→引け(%)": group["発表後初値→引け(%)"].mean(),
+                "平均飛び乗り→引け(%)": group["直後→引け(%)"].mean(),
                 "平均MFE(%)": group["最大上昇幅MFE(%)"].mean(),
                 "平均MAE(%)": group["最大下落幅MAE(%)"].mean(),
                 "確信度": confidence_label(n),
